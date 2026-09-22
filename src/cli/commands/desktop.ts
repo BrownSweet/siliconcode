@@ -1,0 +1,2278 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { existsSync, statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
+import { stdin } from "node:process";
+import { createInterface } from "node:readline";
+import {
+  type FileWithStats,
+  listDirectory,
+  listFilesWithStatsAsync,
+  parseAtQuery,
+  rankPickerCandidates,
+} from "../../at-mentions.js";
+import { pickPrimaryBalance } from "../../client.js";
+import { codeSystemPrompt } from "../../code/prompt.js";
+import { buildCodeToolset } from "../../code/setup.js";
+import {
+  type EditMode,
+  activateModelProvider,
+  deleteModelProvider,
+  isPlausibleKey,
+  loadActiveModelProvider,
+  loadApiKey,
+  loadBaseUrl,
+  loadCustomProviderName,
+  loadDesktopOpenTabs,
+  loadDiagnosticsEnabled,
+  loadEditMode,
+  loadEditor,
+  loadMaxOutputTokens,
+  loadMcpToolProfile,
+  loadModel,
+  loadModelProviderKind,
+  loadModelProviders,
+  loadPreset,
+  loadProviderUserId,
+  loadReasoningEffort,
+  loadRecentWorkspaces,
+  loadResolvedSkillPaths,
+  loadThinkingMode,
+  loadWorkspaceDir,
+  normalizeMcpConfig,
+  pushRecentWorkspace,
+  readConfig,
+  saveActiveModelProviderApiKey,
+  saveDesktopOpenTabs,
+  saveEditMode,
+  saveEditor,
+  saveModelProvider,
+  saveModelProviderModels,
+  saveReasoningEffort,
+  saveWorkspaceDir,
+  writeConfig,
+} from "../../config.js";
+import { Eventizer } from "../../core/eventize.js";
+import type { Event as KernelEvent } from "../../core/events.js";
+import {
+  type CheckpointVerdict,
+  type ChoiceVerdict,
+  type ConfirmationChoice,
+  type PlanVerdict,
+  type RevisionVerdict,
+  pauseGate,
+} from "../../core/pause-gate.js";
+import { autoResolveVerdict } from "../../core/pause-policy.js";
+import { reportDiagnosticError, setDiagnosticsEnabled } from "../../diagnostics.js";
+import { loadDotenv } from "../../env.js";
+import { CacheFirstLoop, DeepSeekClient, ImmutablePrefix } from "../../index.js";
+import { parseMcpSpec, specToRaw } from "../../mcp/spec.js";
+import { McpToolDirectory } from "../../mcp/tool-directory.js";
+import { selectCodeMcpToolProfile } from "../../mcp/tool-profile.js";
+import {
+  deleteSession,
+  listSessionsForWorkspace,
+  loadSessionMessages,
+  loadSessionMeta,
+  patchSessionMeta,
+  sessionPath,
+  timestampSuffix,
+} from "../../memory/session.js";
+import { MemoryStore } from "../../memory/user.js";
+import { DEEPSEEK_MAX_TOOLS, type ThinkingPreference, migrateRetiredModel } from "../../models.js";
+import { providerClientOptions } from "../../provider-client-options.js";
+import {
+  normalizeProviderApiKey,
+  normalizeProviderBaseUrl,
+  probeOpenAICompatibleProvider,
+  providerApiKeyValidationError,
+} from "../../provider-probe.js";
+import { SkillStore } from "../../skills.js";
+import { countTokensBounded } from "../../tokenizer.js";
+import type { ChoiceOption } from "../../tools/choice.js";
+import type { ChatMessage } from "../../types.js";
+import { VERSION } from "../../version.js";
+import { writeJsonLineSync } from "../jsonl-stdio.js";
+import { canonicalPresetName, resolvePreset } from "../ui/presets.js";
+import { type McpRuntime, createMcpRuntime } from "./mcp-runtime.js";
+
+export interface DesktopOptions {
+  model: string;
+  thinkingMode?: ThinkingPreference;
+  budgetUsd?: number;
+  /** Root directory the agent's filesystem tools operate inside. Defaults to cwd. */
+  dir?: string;
+}
+
+type InMessage = { tabId?: string } & (
+  | { cmd: "runtime_hello"; clientId?: string; protocolVersion?: number }
+  | { cmd: "runtime_ping"; clientId?: string }
+  | { cmd: "runtime_bye"; clientId?: string }
+  | { cmd: "user_input"; text: string }
+  | { cmd: "abort" }
+  | { cmd: "confirm_response"; id: number; response: ConfirmationChoice }
+  | { cmd: "choice_response"; id: number; response: ChoiceVerdict }
+  | { cmd: "plan_response"; id: number; response: PlanVerdict }
+  | { cmd: "checkpoint_response"; id: number; response: CheckpointVerdict }
+  | { cmd: "revision_response"; id: number; response: RevisionVerdict }
+  | { cmd: "session_list" }
+  | { cmd: "session_delete"; name: string }
+  | { cmd: "session_load"; name: string }
+  | { cmd: "new_chat" }
+  | { cmd: "setup_save_key"; key: string }
+  | { cmd: "settings_get" }
+  | { cmd: "provider_probe"; nonce: number; id?: string; baseUrl: string; apiKey?: string }
+  | {
+      cmd: "provider_save";
+      nonce: number;
+      id?: string;
+      kind?: "deepseek" | "custom";
+      name: string;
+      baseUrl: string;
+      model: string;
+      apiKey?: string;
+      preset?: "auto" | "flash" | "pro";
+      reasoningEffortMax?: "auto" | "none" | "high" | "xhigh" | "max";
+      wireApi?: "auto" | "chat_completions" | "responses";
+    }
+  | { cmd: "provider_activate"; id: string }
+  | { cmd: "provider_delete"; id: string }
+  | {
+      cmd: "diagnostic_report";
+      category: string;
+      component: string;
+      errorCode?: string;
+      message?: string;
+      stack?: string;
+      severity?: "error" | "fatal";
+      context?: Record<string, unknown>;
+    }
+  | {
+      cmd: "settings_save";
+      reasoningEffort?: "high" | "max";
+      editMode?: EditMode;
+      budgetUsd?: number | null;
+      baseUrl?: string;
+      model?: string;
+      customProviderName?: string;
+      modelProvider?: "deepseek" | "custom";
+      workspaceDir?: string;
+      preset?: "auto" | "flash" | "pro";
+      editor?: string;
+      diagnosticsEnabled?: boolean;
+    }
+  | { cmd: "mention_query"; query: string; nonce: number }
+  | { cmd: "mention_preview"; path: string; nonce: number }
+  | { cmd: "mention_picked"; path: string }
+  | { cmd: "tab_open"; workspaceDir?: string }
+  | { cmd: "tab_close" }
+  | { cmd: "mcp_specs_get" }
+  | { cmd: "mcp_specs_add"; spec: string }
+  | { cmd: "mcp_specs_remove"; spec: string }
+  | { cmd: "skills_get" }
+  | { cmd: "skill_run"; name: string; args?: string }
+  | { cmd: "jobs_list" }
+  | { cmd: "jobs_stop"; jobId: number }
+  | { cmd: "jobs_stop_all" }
+);
+
+interface NeedsSetupEvent {
+  type: "$needs_setup";
+  reason: "no_api_key";
+}
+
+interface SettingsEvent {
+  type: "$settings";
+  reasoningEffort: "high" | "max";
+  editMode: EditMode;
+  budgetUsd: number | null;
+  baseUrl?: string;
+  apiKeyPrefix?: string;
+  customProviderName?: string;
+  modelProvider: "deepseek" | "custom";
+  activeModelProviderId: string;
+  modelProviders: Array<{
+    id: string;
+    kind: "deepseek" | "custom";
+    name: string;
+    baseUrl?: string;
+    model?: string;
+    models?: string[];
+    preset?: "auto" | "flash" | "pro" | "fast" | "smart" | "max";
+    reasoningEffortMax: "auto" | "none" | "high" | "xhigh" | "max";
+    wireApi: "auto" | "chat_completions" | "responses";
+    apiKeyPrefix?: string;
+  }>;
+  workspaceDir: string;
+  recentWorkspaces: string[];
+  model: string;
+  preset: "auto" | "flash" | "pro";
+  editor?: string;
+  diagnosticsEnabled: boolean;
+  version: string;
+}
+
+interface BalanceEvent {
+  type: "$balance";
+  providerBaseUrl: string;
+  currency: string;
+  total: number;
+  isAvailable: boolean;
+}
+
+interface ProviderProbeEvent {
+  type: "$provider_probe";
+  nonce: number;
+  baseUrl: string;
+  ok: boolean;
+  models?: string[];
+  recommendedModel?: string;
+  providerName?: string;
+  wireApi?: "auto" | "chat_completions" | "responses";
+  code?: string;
+  message?: string;
+  saved?: boolean;
+}
+
+interface PlanRequiredEvent {
+  type: "$plan_required";
+  id: number;
+  plan: string;
+  steps?: unknown[];
+  summary?: string;
+}
+
+interface SessionsEvent {
+  type: "$sessions";
+  items: { name: string; messageCount: number; mtime: string }[];
+}
+
+interface MentionResultsEvent {
+  type: "$mention_results";
+  nonce: number;
+  query: string;
+  results: string[];
+}
+
+interface MentionPreviewEvent {
+  type: "$mention_preview";
+  nonce: number;
+  path: string;
+  head: string;
+  totalLines: number;
+}
+
+interface TabOpenedEvent {
+  type: "$tab_opened";
+  workspaceDir: string;
+}
+
+interface TabClosedEvent {
+  type: "$tab_closed";
+}
+
+interface RuntimeSnapshotEvent {
+  type: "$runtime_snapshot";
+  protocolVersion: number;
+  tabs: { id: string; workspaceDir: string }[];
+  activeTabId: string | null;
+}
+
+interface RuntimePongEvent {
+  type: "$runtime_pong";
+  ts: number;
+}
+
+type LoadedSegment =
+  | { kind: "text"; text: string }
+  | { kind: "reasoning"; text: string }
+  | {
+      kind: "tool";
+      callId: string;
+      name: string;
+      args: string;
+      result?: string;
+      ok?: boolean;
+    };
+
+type LoadedMessage =
+  | { kind: "user"; text: string }
+  | {
+      kind: "assistant";
+      turn: number;
+      segments: LoadedSegment[];
+      pending: false;
+    };
+
+interface SessionLoadedEvent {
+  type: "$session_loaded";
+  name: string;
+  messages: LoadedMessage[];
+  carryover: {
+    totalCostUsd: number;
+    cacheHitTokens: number;
+    cacheMissTokens: number;
+  };
+}
+
+interface SessionEmptyEvent {
+  type: "$session_empty";
+  name: string;
+  sizeBytes: number;
+}
+
+interface ConfirmRequiredEvent {
+  type: "$confirm_required";
+  id: number;
+  kind: "run_command" | "run_background";
+  command: string;
+}
+
+interface PathAccessRequiredEvent {
+  type: "$path_access_required";
+  id: number;
+  path: string;
+  intent: "read" | "write";
+  toolName: string;
+  sandboxRoot: string;
+  allowPrefix: string;
+}
+
+interface ChoiceRequiredEvent {
+  type: "$choice_required";
+  id: number;
+  question: string;
+  options: ChoiceOption[];
+  allowCustom: boolean;
+}
+
+interface PlanStepLite {
+  id: string;
+  title: string;
+  action: string;
+  risk?: "low" | "med" | "high";
+}
+
+interface CheckpointRequiredEvent {
+  type: "$checkpoint_required";
+  id: number;
+  stepId: string;
+  title?: string;
+  result: string;
+  notes?: string;
+  completed: number;
+  total: number;
+}
+
+interface RevisionRequiredEvent {
+  type: "$revision_required";
+  id: number;
+  reason: string;
+  remainingSteps: PlanStepLite[];
+  summary?: string;
+}
+
+interface StepCompletedEvent {
+  type: "$step_completed";
+  stepId: string;
+  title?: string;
+  result: string;
+  notes?: string;
+}
+
+interface PlanClearedEvent {
+  type: "$plan_cleared";
+}
+
+type McpSpecStatus = "configured" | "handshake" | "connected" | "failed" | "disabled";
+
+interface McpSpecInfo {
+  raw: string;
+  name: string | null;
+  transport: "stdio" | "sse" | "streamable-http";
+  summary: string;
+  parseError?: string;
+  status: McpSpecStatus;
+  statusReason?: string;
+  toolCount?: number;
+}
+
+interface McpSpecsEvent {
+  type: "$mcp_specs";
+  specs: McpSpecInfo[];
+  bridged: boolean;
+}
+
+interface CtxBreakdownEvent {
+  type: "$ctx_breakdown";
+  reservedTokens: number;
+}
+
+interface MemoryEntryInfo {
+  name: string;
+  scope: "project" | "global";
+  description: string;
+}
+
+interface MemoryEvent {
+  type: "$memory";
+  entries: MemoryEntryInfo[];
+}
+
+interface SkillInfo {
+  name: string;
+  description: string;
+  scope: "project" | "custom" | "global" | "builtin";
+  path: string;
+  runAs: "inline" | "subagent";
+  model?: string;
+}
+
+interface SkillsEvent {
+  type: "$skills";
+  items: SkillInfo[];
+}
+
+interface JobInfoPayload {
+  id: number;
+  tabId: string;
+  sessionLabel: string;
+  command: string;
+  pid: number | null;
+  running: boolean;
+  exitCode: number | null;
+  startedAt: number;
+  outputTail: string;
+  spawnError?: string;
+}
+
+interface JobsEvent {
+  type: "$jobs";
+  items: JobInfoPayload[];
+}
+
+/** Direct fd write — bypasses Node's stream layer (and its piped-output
+ *  block buffering) so every JSON line reaches Rust the moment it's
+ *  produced, not whenever the next 8 KB flushes. */
+type EmittableEvent =
+  | KernelEvent
+  | { type: "$ready" }
+  | { type: "$error"; message: string }
+  | { type: "$turn_complete" }
+  | ConfirmRequiredEvent
+  | PathAccessRequiredEvent
+  | ChoiceRequiredEvent
+  | PlanRequiredEvent
+  | CheckpointRequiredEvent
+  | RevisionRequiredEvent
+  | StepCompletedEvent
+  | PlanClearedEvent
+  | SessionsEvent
+  | SessionLoadedEvent
+  | SessionEmptyEvent
+  | NeedsSetupEvent
+  | SettingsEvent
+  | BalanceEvent
+  | ProviderProbeEvent
+  | MentionResultsEvent
+  | MentionPreviewEvent
+  | TabOpenedEvent
+  | TabClosedEvent
+  | RuntimeSnapshotEvent
+  | RuntimePongEvent
+  | McpSpecsEvent
+  | SkillsEvent
+  | CtxBreakdownEvent
+  | MemoryEvent
+  | JobsEvent;
+
+function emit(ev: EmittableEvent, tabId?: string): void {
+  const payload = tabId ? { ...ev, tabId } : ev;
+  writeJsonLineSync(1, payload);
+}
+
+function tailLines(s: string, n: number): string {
+  if (!s) return "";
+  const lines = s.split(/\r?\n/);
+  return lines.slice(-n).join("\n");
+}
+
+function buildLoadedMessages(records: ChatMessage[]): LoadedMessage[] {
+  const out: LoadedMessage[] = [];
+  let turn = 0;
+  let pendingAssistantIdx = -1;
+  for (const rec of records) {
+    if (rec.role === "system") continue;
+    if (rec.role === "user") {
+      out.push({ kind: "user", text: rec.content ?? "" });
+      pendingAssistantIdx = -1;
+      continue;
+    }
+    if (rec.role === "assistant") {
+      turn++;
+      const segments: LoadedSegment[] = [];
+      if (rec.reasoning_content) segments.push({ kind: "reasoning", text: rec.reasoning_content });
+      if (rec.content) segments.push({ kind: "text", text: rec.content });
+      if (rec.tool_calls) {
+        for (let i = 0; i < rec.tool_calls.length; i++) {
+          const tc = rec.tool_calls[i];
+          if (!tc) continue;
+          segments.push({
+            kind: "tool",
+            callId: tc.id ?? `tc-r-${turn}-${i}`,
+            name: tc.function?.name ?? "",
+            args: tc.function?.arguments ?? "",
+          });
+        }
+      }
+      out.push({ kind: "assistant", turn, segments, pending: false });
+      pendingAssistantIdx = out.length - 1;
+      continue;
+    }
+    if (rec.role === "tool") {
+      if (pendingAssistantIdx < 0) continue;
+      const host = out[pendingAssistantIdx];
+      if (host?.kind !== "assistant") continue;
+      const callId = rec.tool_call_id;
+      if (!callId) continue;
+      const seg = host.segments.find((s) => s.kind === "tool" && s.callId === callId);
+      if (seg && seg.kind === "tool") {
+        seg.result = rec.content ?? "";
+        seg.ok = !/error|failed/i.test(seg.result.slice(0, 200));
+      }
+    }
+  }
+  return out;
+}
+
+function emitSettings(tab: Tab): void {
+  const activeProvider = loadActiveModelProvider();
+  const apiKey = activeProvider.apiKey;
+  const modelProviders = loadModelProviders().map((provider) => ({
+    id: provider.id,
+    kind: provider.kind,
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    model: provider.model,
+    models: provider.models,
+    preset: provider.preset,
+    reasoningEffortMax:
+      provider.reasoningEffortMax ?? (provider.kind === "deepseek" ? "max" : "auto"),
+    wireApi: provider.wireApi ?? (provider.kind === "deepseek" ? "chat_completions" : "auto"),
+    apiKeyPrefix: provider.apiKey
+      ? `${provider.apiKey.slice(0, 6)}...${provider.apiKey.slice(-3)}`
+      : undefined,
+  }));
+  const recent = loadRecentWorkspaces().filter((p) => p !== tab.rootDir);
+  emit(
+    {
+      type: "$settings",
+      reasoningEffort: loadReasoningEffort(),
+      editMode: loadEditMode(),
+      budgetUsd: tab.runtime?.loop.budgetUsd ?? null,
+      baseUrl: loadBaseUrl(),
+      customProviderName: loadCustomProviderName(),
+      modelProvider: loadModelProviderKind(),
+      activeModelProviderId: activeProvider.id,
+      modelProviders,
+      apiKeyPrefix: apiKey ? `${apiKey.slice(0, 6)}…${apiKey.slice(-3)}` : undefined,
+      workspaceDir: tab.rootDir,
+      recentWorkspaces: recent,
+      model: tab.currentModel,
+      preset: tab.currentPreset,
+      editor: loadEditor(),
+      diagnosticsEnabled: loadDiagnosticsEnabled(),
+      version: VERSION,
+    },
+    tab.id,
+  );
+}
+
+async function emitBalance(tab: Tab): Promise<void> {
+  if (!tab.runtime) return;
+  const client = tab.runtime.loop.client;
+  const bal = await client.getBalance().catch(() => null);
+  if (!bal) return;
+  const primary = pickPrimaryBalance(bal.balance_infos);
+  if (!primary) return;
+  emit(
+    {
+      type: "$balance",
+      providerBaseUrl: client.baseUrl,
+      currency: primary.currency,
+      total: Number(primary.total_balance),
+      isAvailable: bal.is_available,
+    },
+    tab.id,
+  );
+}
+
+function emitSessions(tab: Tab): void {
+  try {
+    const items = listSessionsForWorkspace(tab.rootDir).map((s) => ({
+      name: s.name,
+      messageCount: s.messageCount,
+      mtime: s.mtime.toISOString(),
+      summary: s.meta.summary,
+    }));
+    emit({ type: "$sessions", items }, tab.id);
+  } catch (err) {
+    emit({ type: "$error", message: `session_list failed: ${(err as Error).message}` }, tab.id);
+  }
+}
+
+function summarizeMcpSpec(raw: string): McpSpecInfo {
+  try {
+    const parsed = parseMcpSpec(raw);
+    if (parsed.transport === "stdio") {
+      const argv = [parsed.command, ...parsed.args].join(" ");
+      return {
+        raw,
+        name: parsed.name,
+        transport: "stdio",
+        summary: `stdio · ${argv}`,
+        status: "configured",
+      };
+    }
+    return {
+      raw,
+      name: parsed.name,
+      transport: parsed.transport,
+      summary: `${parsed.transport} · ${parsed.url}`,
+      status: "configured",
+    };
+  } catch (err) {
+    return {
+      raw,
+      name: null,
+      transport: "stdio",
+      summary: raw,
+      parseError: (err as Error).message,
+      status: "failed",
+      statusReason: (err as Error).message,
+    };
+  }
+}
+
+function selectDesktopMcpSpecs(): {
+  configured: string[];
+  active: string[];
+  skipped: string[];
+} {
+  const configured = normalizeMcpConfig(readConfig()).map(specToRaw);
+  const selection = selectCodeMcpToolProfile(configured, loadMcpToolProfile());
+  return { configured, ...selection };
+}
+
+function emitMcpSpecs(tab: Tab): void {
+  const selection = selectDesktopMcpSpecs();
+  const active = new Set(selection.active);
+  const specs = selection.configured.map((raw) => {
+    const base = summarizeMcpSpec(raw);
+    if (!active.has(raw)) {
+      return {
+        ...base,
+        status: "disabled" as const,
+        statusReason: "disabled by the automatic code tool profile",
+      };
+    }
+    const live = tab.mcpStatuses.get(raw);
+    if (!live) return base;
+    return { ...base, status: live.kind, statusReason: live.reason, toolCount: live.toolCount };
+  });
+  const enabledSpecs = specs.filter((spec) => spec.status !== "disabled");
+  const bridged =
+    enabledSpecs.length > 0 && enabledSpecs.every((spec) => spec.status === "connected");
+  emit({ type: "$mcp_specs", specs, bridged }, tab.id);
+}
+
+function emitMemory(tab: Tab): void {
+  try {
+    const store = new MemoryStore({ projectRoot: tab.rootDir });
+    const entries: MemoryEntryInfo[] = store.list().map((e) => ({
+      name: e.name,
+      scope: e.scope,
+      description: e.description,
+    }));
+    emit({ type: "$memory", entries }, tab.id);
+  } catch (err) {
+    emit({ type: "$error", message: `memory_get failed: ${(err as Error).message}` }, tab.id);
+  }
+}
+
+// reserved = system prompt + tool specs, constant for the tab's lifetime once
+// the loop is built. The growing log portion is already covered by the
+// per-turn cache hit/miss numbers in `model.final`.
+function emitCtxBreakdown(tab: Tab): void {
+  if (!tab.runtime) return;
+  try {
+    const sys = countTokensBounded(tab.runtime.loop.prefix.system);
+    const tools = countTokensBounded(JSON.stringify(tab.runtime.loop.prefix.toolSpecs));
+    emit({ type: "$ctx_breakdown", reservedTokens: sys + tools }, tab.id);
+  } catch {
+    // tokenizer warmup can throw on first call before the data file loads
+  }
+}
+
+function emitSkills(tab: Tab): void {
+  try {
+    const store = new SkillStore({
+      projectRoot: tab.rootDir,
+      customSkillPaths: loadResolvedSkillPaths(tab.rootDir),
+    });
+    const items = store.list().map((s) => ({
+      name: s.name,
+      description: s.description,
+      scope: s.scope,
+      path: s.path,
+      runAs: s.runAs,
+      model: s.model,
+    }));
+    emit({ type: "$skills", items }, tab.id);
+  } catch (err) {
+    emit({ type: "$error", message: `skills_get failed: ${(err as Error).message}` }, tab.id);
+  }
+}
+
+interface RuntimeState {
+  loop: CacheFirstLoop;
+  eventizer: Eventizer;
+  ctx: { model: string; prefixHash: string; reasoningEffort: "high" | "max" };
+}
+
+type SymbolEntry = { name: string; path: string; line: number; kind: string };
+
+interface Tab {
+  readonly id: string;
+  rootDir: string;
+  currentSession: string;
+  currentPreset: "auto" | "flash" | "pro";
+  currentModel: string;
+  thinkingMode: ThinkingPreference;
+  budgetUsd: number | undefined;
+  /** null while the tab is bootstrapping — see `initTabToolset`. UI gates input on `$ready`, which only fires once this is set. */
+  toolset: Awaited<ReturnType<typeof buildCodeToolset>> | null;
+  /** Empty while bootstrapping; populated together with `toolset`. */
+  system: string;
+  runtime: RuntimeState | null;
+  aborter: AbortController | null;
+  fileIndex: FileWithStats[] | null;
+  fileIndexBuilding: Promise<FileWithStats[]> | null;
+  fileIndexBuiltAt: number;
+  symbolIndex: SymbolEntry[] | null;
+  symbolBuilding: Promise<SymbolEntry[]> | null;
+  recentMentions: string[];
+  /** Pause-gate ids waiting on this tab — abort uses these to free stranded plan_checkpoint / plan_revision / shell-confirm callers. */
+  pendingGateIds: Set<number>;
+  /** Step ids already marked complete in the in-flight plan — also tells UI when a plan is "active". */
+  completedStepIds: Set<string>;
+  /** Total steps in the in-flight plan (0 = no active plan / steps not provided). */
+  planTotalSteps: number;
+  mcpRuntime: McpRuntime | null;
+  mcpDirectory: McpToolDirectory | null;
+  mcpStatuses: Map<string, { kind: McpSpecStatus; reason?: string; toolCount?: number }>;
+}
+
+let tabCounter = 0;
+function nextTabId(): string {
+  tabCounter++;
+  return `t${tabCounter}`;
+}
+
+function mintSessionFor(rootDir: string): string {
+  const name = `desktop-${timestampSuffix()}-${tabCounter}`;
+  try {
+    patchSessionMeta(name, { workspace: rootDir });
+  } catch {
+    // session meta is for filtering only — failure shouldn't block chat
+  }
+  return name;
+}
+
+function buildRuntimeFor(tab: Tab): RuntimeState {
+  if (!tab.toolset) throw new Error("buildRuntimeFor called before initTabToolset finished");
+  const toolset = tab.toolset;
+  const provider = loadActiveModelProvider();
+  const client = new DeepSeekClient(providerClientOptions(provider));
+  const prefix = new ImmutablePrefix({ system: tab.system, toolSpecs: toolset.tools.specs() });
+  const reasoningEffort = loadReasoningEffort();
+  const { autoEscalate: presetAutoEscalate } = resolvePreset(tab.currentPreset);
+  const autoEscalate = provider.kind === "deepseek" ? presetAutoEscalate : false;
+  const loop = new CacheFirstLoop({
+    client,
+    prefix,
+    tools: toolset.tools,
+    model: tab.currentModel,
+    budgetUsd: tab.budgetUsd,
+    session: tab.currentSession,
+    reasoningEffort,
+    thinkingMode: tab.thinkingMode,
+    maxOutputTokens: loadMaxOutputTokens(),
+    userId: loadProviderUserId(),
+    autoEscalate,
+  });
+  const eventizer = new Eventizer();
+  const ctx = { model: tab.currentModel, prefixHash: prefix.fingerprint, reasoningEffort };
+  return { loop, eventizer, ctx };
+}
+
+const TS_EXPORT_RE =
+  /^export\s+(?:default\s+)?(?:async\s+)?(function|class|const|let|var|interface|type|enum)\s+\*?\s*(\w+)/;
+
+/** TTL on the in-memory file index — without this, files deleted / renamed since the last @ popup still show up as candidates. 10s balances "fresh enough for typical edit-then-mention flows" against "don't re-scan 5000 files on every keystroke". */
+const FILE_INDEX_TTL_MS = 10_000;
+
+async function getFileIndexFor(tab: Tab): Promise<FileWithStats[]> {
+  const fresh = tab.fileIndex && Date.now() - tab.fileIndexBuiltAt < FILE_INDEX_TTL_MS;
+  if (fresh) return tab.fileIndex as FileWithStats[];
+  if (tab.fileIndexBuilding) return tab.fileIndexBuilding;
+  tab.fileIndexBuilding = listFilesWithStatsAsync(tab.rootDir, { maxResults: 5000 })
+    .then((res) => {
+      tab.fileIndex = res;
+      tab.fileIndexBuiltAt = Date.now();
+      tab.fileIndexBuilding = null;
+      return res;
+    })
+    .catch((err) => {
+      tab.fileIndexBuilding = null;
+      throw err;
+    });
+  return tab.fileIndexBuilding;
+}
+
+async function getSymbolIndexFor(tab: Tab): Promise<SymbolEntry[]> {
+  if (tab.symbolIndex) return tab.symbolIndex;
+  if (tab.symbolBuilding) return tab.symbolBuilding;
+  tab.symbolBuilding = (async () => {
+    const files = await getFileIndexFor(tab);
+    const sourceExts = /\.(?:ts|tsx|js|jsx|mts|cts)$/;
+    const candidates = files.filter((f) => sourceExts.test(f.path)).slice(0, 1500);
+    const out: SymbolEntry[] = [];
+    const PARALLEL = 16;
+    for (let i = 0; i < candidates.length; i += PARALLEL) {
+      const batch = candidates.slice(i, i + PARALLEL);
+      await Promise.all(
+        batch.map(async (entry) => {
+          const abs = isAbsolute(entry.path) ? entry.path : join(tab.rootDir, entry.path);
+          try {
+            const text = await readFile(abs, "utf8");
+            const lines = text.split(/\r?\n/);
+            for (let li = 0; li < lines.length; li++) {
+              const line = lines[li]!;
+              if (!line.startsWith("export ")) continue;
+              const m = TS_EXPORT_RE.exec(line);
+              if (m) out.push({ kind: m[1]!, name: m[2]!, path: entry.path, line: li + 1 });
+            }
+          } catch {
+            // unreadable / binary — skip
+          }
+        }),
+      );
+    }
+    tab.symbolIndex = out;
+    tab.symbolBuilding = null;
+    return out;
+  })().catch((err) => {
+    tab.symbolBuilding = null;
+    throw err;
+  });
+  return tab.symbolBuilding;
+}
+
+function rankSymbols(syms: readonly SymbolEntry[], q: string, limit: number): string[] {
+  const needle = q.toLowerCase();
+  const scored: { entry: SymbolEntry; score: number }[] = [];
+  for (const s of syms) {
+    const lower = s.name.toLowerCase();
+    let score: number;
+    if (lower === needle) score = 0;
+    else if (lower.startsWith(needle)) score = 100;
+    else if (lower.includes(needle)) score = 500 + lower.indexOf(needle);
+    else continue;
+    scored.push({ entry: s, score });
+  }
+  scored.sort((a, b) => a.score - b.score || a.entry.name.localeCompare(b.entry.name));
+  return scored.slice(0, limit).map((s) => `${s.entry.path}:${s.entry.line}`);
+}
+
+function pushMentionRecent(tab: Tab, path: string): void {
+  const MAX = 20;
+  const idx = tab.recentMentions.indexOf(path);
+  if (idx >= 0) tab.recentMentions.splice(idx, 1);
+  tab.recentMentions.unshift(path);
+  if (tab.recentMentions.length > MAX) tab.recentMentions.length = MAX;
+}
+
+/** The desktop sidecar is a long-running daemon — Tauri spawns this Node process once per app launch and pipes JSON over stdin/stdout. Without these handlers, any orphaned promise rejection (e.g. from an aborted turn whose cleanup races a session-switch — #1074) crashes the process with exit code 1, which the Tauri host surfaces as "brown exited (code 1)" and a full reconnect cycle. Log loudly so we can find the underlying bug, but don't take the daemon down. */
+export function installDesktopCrashGuards(
+  stderr: { write: (s: string) => unknown } = process.stderr,
+): void {
+  process.on("unhandledRejection", (reason) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    stderr.write(`[desktop] unhandledRejection: ${err.stack ?? err.message}\n`);
+  });
+  process.on("uncaughtException", (err) => {
+    stderr.write(`[desktop] uncaughtException: ${err.stack ?? err.message}\n`);
+  });
+}
+
+export async function desktopCommand(opts: DesktopOptions): Promise<void> {
+  loadDotenv();
+  installDesktopCrashGuards();
+
+  const tabs = new Map<string, Tab>();
+  const providerCatalogRefreshes = new Set<string>();
+  const tabContext = new AsyncLocalStorage<string>();
+
+  function activeRunningTab(): Tab | undefined {
+    const id = tabContext.getStore();
+    return id ? tabs.get(id) : undefined;
+  }
+
+  /** Synchronous tab construction — no I/O. All cheap, disk-only events (`$settings`, `$sessions`, `$memory`, `$skills`, `$mcp_specs`) can fire against this immediately. The heavy bits (`buildCodeToolset`, MCP probes, runtime construction) happen in `initTabToolset` so the UI shell paints without waiting for them. */
+  function createTabSkeleton(initialDir?: string): Tab {
+    const dir = resolve(initialDir ?? opts.dir ?? loadWorkspaceDir() ?? process.cwd());
+    pushRecentWorkspace(dir);
+    const activeProvider = loadActiveModelProvider();
+    const preset = canonicalPresetName(activeProvider.preset ?? loadPreset());
+    const resolved = resolvePreset(preset);
+    const modelSelection = migrateRetiredModel(
+      opts.model || activeProvider.model || loadModel() || resolved.model,
+    );
+    const model = modelSelection.model;
+    const tab: Tab = {
+      id: nextTabId(),
+      rootDir: dir,
+      currentSession: "",
+      currentPreset: preset,
+      currentModel: model,
+      thinkingMode: modelSelection.thinking ?? opts.thinkingMode ?? loadThinkingMode(),
+      budgetUsd: opts.budgetUsd,
+      toolset: null,
+      system: "",
+      runtime: null,
+      aborter: null,
+      fileIndex: null,
+      fileIndexBuilding: null,
+      fileIndexBuiltAt: 0,
+      symbolIndex: null,
+      symbolBuilding: null,
+      recentMentions: [],
+      pendingGateIds: new Set<number>(),
+      completedStepIds: new Set<string>(),
+      planTotalSteps: 0,
+      mcpRuntime: null,
+      mcpDirectory: null,
+      mcpStatuses: new Map(),
+    };
+    tab.currentSession = mintSessionFor(dir);
+    tabs.set(tab.id, tab);
+    return tab;
+  }
+
+  /** Builds the toolset / system prompt / runtime / MCP bridge for a freshly-created skeleton. Reads `tab.currentModel` at call time so preset changes that landed during the wait are honored. */
+  async function initTabToolset(tab: Tab): Promise<void> {
+    const toolset = await buildCodeToolset({
+      rootDir: tab.rootDir,
+      onSkillInstalled: () => emitSkills(tab),
+      onJobsChanged: () => emitJobs(),
+    });
+    tab.toolset = toolset;
+    tab.system = codeSystemPrompt(tab.rootDir, {
+      hasSemanticSearch: toolset.semantic.enabled,
+      modelId: tab.currentModel,
+    });
+    if (loadApiKey()) {
+      tab.runtime = buildRuntimeFor(tab);
+      void bridgeTabMcp(tab);
+    }
+  }
+
+  function applyActiveProviderToTabs(): void {
+    const provider = loadActiveModelProvider();
+    const preset = canonicalPresetName(provider.preset ?? loadPreset());
+    const resolved = resolvePreset(preset);
+    const modelSelection = migrateRetiredModel(provider.model || resolved.model);
+    for (const target of tabs.values()) {
+      abortTurn(target);
+      cancelPendingGates(target);
+      target.currentPreset = preset;
+      target.currentModel = modelSelection.model;
+      target.thinkingMode = modelSelection.thinking ?? loadThinkingMode();
+      if (target.toolset) {
+        target.system = codeSystemPrompt(target.rootDir, {
+          hasSemanticSearch: target.toolset.semantic.enabled,
+          modelId: target.currentModel,
+        });
+        target.runtime = provider.apiKey ? buildRuntimeFor(target) : null;
+      }
+      if (target.runtime) emit({ type: "$ready" }, target.id);
+      else emit({ type: "$needs_setup", reason: "no_api_key" }, target.id);
+      emitSettings(target);
+      void emitBalance(target);
+    }
+  }
+
+  function refreshActiveProviderCatalog(): void {
+    const provider = loadActiveModelProvider();
+    if (
+      provider.kind !== "custom" ||
+      !provider.baseUrl ||
+      !provider.apiKey ||
+      provider.models?.length ||
+      providerCatalogRefreshes.has(provider.id)
+    ) {
+      return;
+    }
+    providerCatalogRefreshes.add(provider.id);
+    void probeOpenAICompatibleProvider({
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+    })
+      .then((result) => {
+        if (!result.ok) return;
+        saveModelProviderModels(provider.id, result.models);
+        for (const target of tabs.values()) emitSettings(target);
+      })
+      .catch(() => undefined)
+      .finally(() => providerCatalogRefreshes.delete(provider.id));
+  }
+
+  function bridgeTabMcp(tab: Tab): Promise<void> {
+    if (!tab.runtime || !tab.toolset) return Promise.resolve();
+    const selection = selectDesktopMcpSpecs();
+    const active = new Set(selection.active);
+    for (const raw of selection.configured) {
+      if (active.has(raw)) {
+        const current = tab.mcpStatuses.get(raw);
+        if (current?.kind === "disabled" && current.reason === "automatic code tool profile") {
+          tab.mcpStatuses.delete(raw);
+        }
+      } else {
+        tab.mcpStatuses.set(raw, {
+          kind: "disabled",
+          reason: "automatic code tool profile",
+        });
+      }
+    }
+    if (tab.mcpRuntime) {
+      // Already constructed — reload so new/removed specs settle without restart.
+      return tab.mcpRuntime
+        .reloadFromConfig(tab.runtime.loop)
+        .then(() => emitMcpSpecs(tab))
+        .catch((err) => {
+          emit({ type: "$error", message: `mcp reload failed: ${(err as Error).message}` }, tab.id);
+        });
+    }
+    const requested = selection.active.length;
+    if (requested === 0) return Promise.resolve();
+    const runtime = createMcpRuntime({
+      getTools: () => {
+        if (!tab.toolset) throw new Error("toolset gone");
+        return tab.toolset.tools;
+      },
+      getMcpPrefix: () => undefined,
+      getRequestedCount: () => selectDesktopMcpSpecs().active.length,
+      selectConfiguredSpecs: (specs) =>
+        selectCodeMcpToolProfile(specs, loadMcpToolProfile()).active,
+      maxTools: DEEPSEEK_MAX_TOOLS,
+      getDirectory: () => {
+        if (!tab.toolset) return undefined;
+        tab.mcpDirectory ??= new McpToolDirectory(tab.toolset.tools);
+        return tab.mcpDirectory;
+      },
+      progressSink: { current: null },
+    });
+    tab.mcpRuntime = runtime;
+    runtime.setLifecycleSink((notice) => {
+      if (notice.kind === "slow") return; // not surfaced in the desktop panel
+      const cfg = readConfig().mcp ?? [];
+      const target = cfg.find((raw) => {
+        try {
+          return parseMcpSpec(raw).name === notice.name;
+        } catch {
+          return false;
+        }
+      });
+      if (!target) return;
+      if (notice.kind === "handshake") {
+        tab.mcpStatuses.set(target, { kind: "handshake" });
+      } else if (notice.kind === "connected") {
+        tab.mcpStatuses.set(target, { kind: "connected", toolCount: notice.tools });
+      } else if (notice.kind === "failed") {
+        tab.mcpStatuses.set(target, { kind: "failed", reason: notice.reason });
+      } else if (notice.kind === "disabled") {
+        tab.mcpStatuses.set(target, { kind: "disabled" });
+      }
+      emitMcpSpecs(tab);
+    });
+    return runtime
+      .reloadFromConfig(tab.runtime.loop)
+      .then(() => undefined)
+      .catch((err) => {
+        emit({ type: "$error", message: `mcp bridge failed: ${(err as Error).message}` }, tab.id);
+      });
+  }
+
+  /** Snapshot of every open tab's workspace dir, in tab order. Persisted after open/close so a restart restores the full tab set (issue #933). */
+  function persistOpenTabs(): void {
+    try {
+      saveDesktopOpenTabs(Array.from(tabs.values()).map((t) => t.rootDir));
+    } catch {
+      // best-effort — disk / perms shouldn't break tab management
+    }
+  }
+
+  async function closeTab(tab: Tab): Promise<void> {
+    abortTurn(tab);
+    try {
+      await tab.toolset?.jobs.shutdown();
+    } catch {
+      // shutdown errors aren't actionable here
+    }
+    if (tab.mcpRuntime) {
+      try {
+        await tab.mcpRuntime.closeAll();
+      } catch {
+        // MCP shutdown errors aren't actionable here either
+      }
+    }
+    tabs.delete(tab.id);
+    if (first && first.id === tab.id) {
+      const next = tabs.values().next().value;
+      if (next) first = next;
+    }
+    persistOpenTabs();
+    emit({ type: "$tab_closed" }, tab.id);
+  }
+
+  async function runTurn(tab: Tab, text: string): Promise<void> {
+    if (!tab.runtime) return;
+    const rt = tab.runtime;
+    tab.aborter = new AbortController();
+    if (tab.currentSession) {
+      const existing = loadSessionMeta(tab.currentSession).summary;
+      if (!existing || !existing.trim()) {
+        const summary = text.replace(/\s+/g, " ").trim().slice(0, 60);
+        if (summary) {
+          try {
+            patchSessionMeta(tab.currentSession, { summary });
+          } catch {
+            // meta is for display only — failure shouldn't block the turn
+          }
+        }
+      }
+    }
+    await tabContext.run(tab.id, async () => {
+      try {
+        for await (const ev of rt.loop.step(text)) {
+          for (const kev of rt.eventizer.consume(ev, rt.ctx)) emit(kev, tab.id);
+          // Memory tools mutate disk state behind the loop's back — the UI
+          // panel won't know until we re-emit. Without this the right-hand
+          // panel only updates on tab reopen.
+          if (ev.role === "tool" && (ev.toolName === "remember" || ev.toolName === "forget")) {
+            emitMemory(tab);
+          }
+          if (tab.aborter?.signal.aborted) break;
+        }
+      } catch (err) {
+        emit({ type: "$error", message: (err as Error).message }, tab.id);
+      } finally {
+        tab.aborter = null;
+        emit({ type: "$turn_complete" }, tab.id);
+        if (tab.planTotalSteps > 0 && tab.completedStepIds.size >= tab.planTotalSteps) {
+          tab.completedStepIds.clear();
+          tab.planTotalSteps = 0;
+          emit({ type: "$plan_cleared" }, tab.id);
+        }
+        emitSessions(tab);
+        void emitBalance(tab);
+      }
+    });
+  }
+
+  async function switchWorkspace(tab: Tab, nextDir: string): Promise<void> {
+    const target = resolve(nextDir);
+    if (target === tab.rootDir) {
+      emitSettings(tab);
+      return;
+    }
+    if (!existsSync(target) || !statSync(target).isDirectory()) {
+      emit({ type: "$error", message: `Workspace not found: ${target}` }, tab.id);
+      emitSettings(tab);
+      return;
+    }
+    abortTurn(tab);
+    try {
+      await tab.toolset?.jobs.shutdown();
+    } catch {
+      // shutdown errors aren't actionable here
+    }
+    tab.rootDir = target;
+    saveWorkspaceDir(target);
+    pushRecentWorkspace(target);
+    tab.fileIndex = null;
+    tab.fileIndexBuilding = null;
+    tab.fileIndexBuiltAt = 0;
+    tab.symbolIndex = null;
+    tab.symbolBuilding = null;
+    tab.recentMentions.length = 0;
+    tab.currentSession = mintSessionFor(target);
+    tab.toolset = await buildCodeToolset({
+      rootDir: target,
+      onSkillInstalled: () => emitSkills(tab),
+      onJobsChanged: () => emitJobs(),
+    });
+    tab.system = codeSystemPrompt(target, {
+      hasSemanticSearch: tab.toolset.semantic.enabled,
+      modelId: tab.currentModel,
+    });
+    if (tab.runtime) tab.runtime = buildRuntimeFor(tab);
+    emitSessions(tab);
+    emitSettings(tab);
+    refreshActiveProviderCatalog();
+    emitSkills(tab);
+  }
+
+  function forgetGate(id: number): Tab | undefined {
+    for (const t of tabs.values()) {
+      if (t.pendingGateIds.delete(id)) return t;
+    }
+    return undefined;
+  }
+
+  function abortTurn(tab: Tab): void {
+    tab.aborter?.abort();
+    tab.runtime?.loop.abort();
+  }
+
+  function tabSessionLabel(tab: Tab): string {
+    if (tab.currentSession) {
+      try {
+        const summary = loadSessionMeta(tab.currentSession).summary?.trim();
+        if (summary) return summary;
+      } catch {
+        // session file unreadable — fall through to workspace basename
+      }
+    }
+    return tab.rootDir.split(/[\\/]/).filter(Boolean).pop() ?? tab.rootDir;
+  }
+
+  function emitJobs(): void {
+    const items: JobInfoPayload[] = [];
+    for (const t of tabs.values()) {
+      const reg = t.toolset?.jobs;
+      if (!reg) continue;
+      const label = tabSessionLabel(t);
+      for (const j of reg.list()) {
+        items.push({
+          id: j.id,
+          tabId: t.id,
+          sessionLabel: label,
+          command: j.command,
+          pid: j.pid,
+          running: j.running,
+          exitCode: j.exitCode,
+          startedAt: j.startedAt,
+          outputTail: tailLines(j.output, 8),
+          spawnError: j.spawnError,
+        });
+      }
+    }
+    items.sort((a, b) => {
+      if (a.running !== b.running) return a.running ? -1 : 1;
+      return b.startedAt - a.startedAt;
+    });
+    emit({ type: "$jobs", items });
+  }
+
+  function emitRuntimeSnapshot(): void {
+    const activeTabId = first?.id ?? tabs.values().next().value?.id ?? null;
+    emit({
+      type: "$runtime_snapshot",
+      protocolVersion: 1,
+      tabs: Array.from(tabs.values()).map((tab) => ({
+        id: tab.id,
+        workspaceDir: tab.rootDir,
+      })),
+      activeTabId,
+    });
+  }
+
+  function replayTabState(tab: Tab): void {
+    emitSettings(tab);
+    emitSessions(tab);
+    emitMcpSpecs(tab);
+    emitSkills(tab);
+    emitMemory(tab);
+    if (tab.runtime) {
+      emit({ type: "$ready" }, tab.id);
+      void emitBalance(tab);
+    } else if (!loadApiKey()) {
+      emit({ type: "$needs_setup", reason: "no_api_key" }, tab.id);
+    }
+  }
+
+  function replayRuntimeState(): void {
+    emitRuntimeSnapshot();
+    for (const tab of tabs.values()) replayTabState(tab);
+    emitJobs();
+  }
+
+  async function stopJob(jobId: number): Promise<boolean> {
+    for (const t of tabs.values()) {
+      const reg = t.toolset?.jobs;
+      if (!reg) continue;
+      const hit = reg.list().find((j) => j.id === jobId);
+      if (!hit) continue;
+      await reg.stop(jobId);
+      return true;
+    }
+    return false;
+  }
+
+  async function stopAllJobs(): Promise<void> {
+    const ops: Promise<unknown>[] = [];
+    for (const t of tabs.values()) {
+      const reg = t.toolset?.jobs;
+      if (!reg) continue;
+      for (const j of reg.list()) {
+        if (j.running) ops.push(reg.stop(j.id));
+      }
+    }
+    await Promise.allSettled(ops);
+  }
+
+  function cancelPendingGates(tab: Tab): void {
+    const hadActivePlan = tab.planTotalSteps > 0 || tab.completedStepIds.size > 0;
+    const ids = [...tab.pendingGateIds];
+    tab.pendingGateIds.clear();
+    for (const id of ids) pauseGate.cancel(id);
+    if (hadActivePlan) {
+      tab.completedStepIds.clear();
+      tab.planTotalSteps = 0;
+      emit({ type: "$plan_cleared" }, tab.id);
+    }
+  }
+
+  // `first` is the fallback tab for legacy tabId-less RPC messages. We
+  // assign it lazily below so saved-tabs restore (issue #933) can choose
+  // the boot dir before construction, and rotate `first` to the next
+  // surviving tab when its source closes.
+  let first: Tab;
+
+  const FRONTEND_IDLE_EXIT_MS = 75_000;
+  const FRONTEND_IDLE_CHECK_MS = 15_000;
+  let lastFrontendSeenAt = Date.now();
+
+  let shuttingDown = false;
+  async function gracefulShutdown(): Promise<void> {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    for (const tab of tabs.values()) abortTurn(tab);
+    await Promise.allSettled(
+      [...tabs.values()].flatMap((t) => [
+        t.toolset?.jobs.shutdown(1500) ?? Promise.resolve(),
+        t.mcpRuntime?.closeAll() ?? Promise.resolve(),
+      ]),
+    );
+    process.exit(0);
+  }
+  process.on("SIGTERM", () => {
+    void gracefulShutdown();
+  });
+  process.on("SIGINT", () => {
+    void gracefulShutdown();
+  });
+
+  const frontendIdleTimer = setInterval(() => {
+    if (shuttingDown) return;
+    if (Date.now() - lastFrontendSeenAt >= FRONTEND_IDLE_EXIT_MS) {
+      process.stderr.write("[desktop] frontend heartbeat expired; shutting down sidecar\n");
+      void gracefulShutdown();
+    }
+  }, FRONTEND_IDLE_CHECK_MS);
+  frontendIdleTimer.unref?.();
+
+  pauseGate.on((req) => {
+    const tab = activeRunningTab();
+    const tabId = tab?.id;
+    if (tab) tab.pendingGateIds.add(req.id);
+    // Shared auto-resolve policy (e.g. plan_checkpoint in auto/yolo) — must
+    // still run BEFORE we emit any UI event, otherwise the surface flickers
+    // a card that we'd immediately tear down.
+    const auto = autoResolveVerdict(req, loadEditMode());
+    if (auto !== null) {
+      // plan_checkpoint specifically needs the step-completed signal to flow
+      // through so the rail progress ticks. Emit it before resolving.
+      if (req.kind === "plan_checkpoint") {
+        const payload = req.payload as {
+          stepId: string;
+          title?: string;
+          result: string;
+          notes?: string;
+        };
+        if (tab) tab.completedStepIds.add(payload.stepId);
+        emit(
+          {
+            type: "$step_completed",
+            stepId: payload.stepId,
+            title: payload.title,
+            result: payload.result,
+            notes: payload.notes,
+          },
+          tabId,
+        );
+      }
+      if (tab) tab.pendingGateIds.delete(req.id);
+      pauseGate.resolve(req.id, auto);
+      return;
+    }
+    if (req.kind === "run_command" || req.kind === "run_background") {
+      const payload = req.payload as { command?: string };
+      emit(
+        { type: "$confirm_required", id: req.id, kind: req.kind, command: payload.command ?? "" },
+        tabId,
+      );
+      return;
+    }
+    if (req.kind === "path_access") {
+      const payload = req.payload as {
+        path: string;
+        intent: "read" | "write";
+        toolName: string;
+        sandboxRoot: string;
+        allowPrefix: string;
+      };
+      emit(
+        {
+          type: "$path_access_required",
+          id: req.id,
+          path: payload.path,
+          intent: payload.intent,
+          toolName: payload.toolName,
+          sandboxRoot: payload.sandboxRoot,
+          allowPrefix: payload.allowPrefix,
+        },
+        tabId,
+      );
+      return;
+    }
+    if (req.kind === "choice") {
+      const payload = req.payload as {
+        question: string;
+        options: ChoiceOption[];
+        allowCustom: boolean;
+      };
+      emit(
+        {
+          type: "$choice_required",
+          id: req.id,
+          question: payload.question,
+          options: payload.options,
+          allowCustom: payload.allowCustom,
+        },
+        tabId,
+      );
+      return;
+    }
+    if (req.kind === "plan_proposed") {
+      const payload = req.payload as { plan: string; steps?: PlanStepLite[]; summary?: string };
+      if (tab) {
+        tab.completedStepIds.clear();
+        tab.planTotalSteps = payload.steps?.length ?? 0;
+      }
+      emit(
+        {
+          type: "$plan_required",
+          id: req.id,
+          plan: payload.plan,
+          steps: payload.steps,
+          summary: payload.summary,
+        },
+        tabId,
+      );
+      return;
+    }
+    if (req.kind === "plan_checkpoint") {
+      const payload = req.payload as {
+        stepId: string;
+        title?: string;
+        result: string;
+        notes?: string;
+      };
+      if (tab) tab.completedStepIds.add(payload.stepId);
+      emit(
+        {
+          type: "$step_completed",
+          stepId: payload.stepId,
+          title: payload.title,
+          result: payload.result,
+          notes: payload.notes,
+        },
+        tabId,
+      );
+      emit(
+        {
+          type: "$checkpoint_required",
+          id: req.id,
+          stepId: payload.stepId,
+          title: payload.title,
+          result: payload.result,
+          notes: payload.notes,
+          completed: tab?.completedStepIds.size ?? 0,
+          total: tab?.planTotalSteps ?? 0,
+        },
+        tabId,
+      );
+      return;
+    }
+    if (req.kind === "plan_revision") {
+      const payload = req.payload as {
+        reason: string;
+        remainingSteps: PlanStepLite[];
+        summary?: string;
+      };
+      emit(
+        {
+          type: "$revision_required",
+          id: req.id,
+          reason: payload.reason,
+          remainingSteps: payload.remainingSteps,
+          summary: payload.summary,
+        },
+        tabId,
+      );
+      return;
+    }
+    // Unknown PauseKind — `never` makes a new kind without a handler a compile
+    // error; the runtime cancel is the last-mile defense so the agent loop
+    // doesn't hang waiting on a request no one will resolve.
+    const exhaustive: never = req.kind;
+    process.stderr.write(
+      `[desktop] no handler for pause kind "${String(exhaustive)}" — auto-cancelling gate id=${req.id}\n`,
+    );
+    if (tab) tab.pendingGateIds.delete(req.id);
+    pauseGate.cancel(req.id);
+  });
+
+  // Fast-path: emit disk-only events immediately so the UI shell renders
+  // before the toolset finishes building. Heavy work (semantic bootstrap,
+  // MCP probes, runtime construction) runs in initTabToolset which fires
+  // `$ready` when it completes — until then `state.ready` keeps the
+  // composer disabled, so users can't send a message before the runtime
+  // exists. emitBalance was already fire-and-forget.
+  function bootstrapTab(initialDir?: string): Tab {
+    const tab = createTabSkeleton(initialDir);
+    emit({ type: "$tab_opened", workspaceDir: tab.rootDir }, tab.id);
+    emitSessions(tab);
+    emitSettings(tab);
+    refreshActiveProviderCatalog();
+    emitMcpSpecs(tab);
+    emitSkills(tab);
+    emitMemory(tab);
+    if (!loadApiKey()) emit({ type: "$needs_setup", reason: "no_api_key" }, tab.id);
+    void emitBalance(tab);
+    void initTabToolset(tab)
+      .then(() => {
+        if (loadApiKey()) emit({ type: "$ready" }, tab.id);
+        emitCtxBreakdown(tab);
+      })
+      .catch((err) => {
+        emit({ type: "$error", message: `init failed: ${(err as Error).message}` }, tab.id);
+      });
+    return tab;
+  }
+
+  // Restore the full tab set from the previous session (issue #933).
+  // `--dir` overrides saved tabs so a CLI-supplied workspace stays
+  // authoritative. Missing dirs are silently skipped — a deleted
+  // workspace shouldn't block boot.
+  const savedTabDirs = opts.dir
+    ? []
+    : loadDesktopOpenTabs().filter((d) => {
+        try {
+          return existsSync(d) && statSync(d).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+  first = bootstrapTab(savedTabDirs[0]);
+  for (const d of savedTabDirs.slice(1)) {
+    if (resolve(d) === first.rootDir) continue;
+    bootstrapTab(d);
+  }
+  persistOpenTabs();
+
+  const rl = createInterface({ input: stdin });
+  rl.on("line", (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let msg: InMessage;
+    try {
+      msg = JSON.parse(trimmed) as InMessage;
+    } catch {
+      emit({ type: "$error", message: `bad json on stdin: ${trimmed.slice(0, 80)}` });
+      return;
+    }
+    lastFrontendSeenAt = Date.now();
+
+    if (msg.cmd === "diagnostic_report") {
+      reportDiagnosticError({
+        source: "desktop",
+        severity: msg.severity,
+        category: msg.category,
+        component: msg.component,
+        errorCode: msg.errorCode,
+        message: msg.message,
+        stack: msg.stack,
+        context: msg.context,
+      });
+      return;
+    }
+
+    if (msg.cmd === "runtime_hello") {
+      replayRuntimeState();
+      return;
+    }
+    if (msg.cmd === "runtime_ping") {
+      emit({ type: "$runtime_pong", ts: Date.now() });
+      return;
+    }
+    if (msg.cmd === "runtime_bye") {
+      void gracefulShutdown();
+      return;
+    }
+    if (msg.cmd === "tab_open") {
+      try {
+        bootstrapTab(msg.workspaceDir);
+        persistOpenTabs();
+      } catch (err) {
+        emit({ type: "$error", message: `tab_open failed: ${(err as Error).message}` });
+      }
+      return;
+    }
+    if (msg.cmd === "confirm_response") {
+      forgetGate(msg.id);
+      pauseGate.resolve(msg.id, msg.response);
+      return;
+    }
+    if (msg.cmd === "choice_response") {
+      forgetGate(msg.id);
+      pauseGate.resolve(msg.id, msg.response);
+      return;
+    }
+    if (msg.cmd === "plan_response") {
+      const tab = forgetGate(msg.id);
+      if (tab && msg.response.type === "cancel") {
+        tab.completedStepIds.clear();
+        tab.planTotalSteps = 0;
+        emit({ type: "$plan_cleared" }, tab.id);
+      }
+      pauseGate.resolve(msg.id, msg.response);
+      return;
+    }
+    if (msg.cmd === "checkpoint_response") {
+      const tab = forgetGate(msg.id);
+      if (tab && msg.response.type === "stop") {
+        tab.completedStepIds.clear();
+        tab.planTotalSteps = 0;
+        emit({ type: "$plan_cleared" }, tab.id);
+      }
+      pauseGate.resolve(msg.id, msg.response);
+      return;
+    }
+    if (msg.cmd === "revision_response") {
+      forgetGate(msg.id);
+      pauseGate.resolve(msg.id, msg.response);
+      return;
+    }
+    if (msg.cmd === "setup_save_key") {
+      const key = msg.key.trim();
+      if (!isPlausibleKey(key)) {
+        emit({
+          type: "$error",
+          message: "Key looks too short — paste the full token (16+ chars, no spaces).",
+        });
+        return;
+      }
+      try {
+        saveActiveModelProviderApiKey(key);
+        for (const tab of tabs.values()) {
+          // Skeleton tabs still mid-bootstrap pick up the new key inside
+          // initTabToolset's tail when buildCodeToolset settles — don't
+          // try to construct a runtime against a null toolset here.
+          if (!tab.toolset) {
+            emitSettings(tab);
+            void emitBalance(tab);
+            continue;
+          }
+          tab.runtime = buildRuntimeFor(tab);
+          emit({ type: "$ready" }, tab.id);
+          emitSettings(tab);
+          void emitBalance(tab);
+        }
+      } catch (err) {
+        emit({
+          type: "$error",
+          message: `save provider API key failed: ${(err as Error).message}`,
+        });
+      }
+      return;
+    }
+
+    if (msg.cmd === "jobs_list") {
+      emitJobs();
+      return;
+    }
+    if (msg.cmd === "jobs_stop") {
+      void stopJob(msg.jobId).finally(() => emitJobs());
+      return;
+    }
+    if (msg.cmd === "jobs_stop_all") {
+      void stopAllJobs().finally(() => emitJobs());
+      return;
+    }
+
+    const tab = msg.tabId ? tabs.get(msg.tabId) : first;
+    if (!tab) {
+      // No tabId on the emit ⇒ the renderer's per-tab router drops it
+      // silently. Surface to stderr instead so it's at least visible
+      // when the desktop is launched from a terminal.
+      process.stderr.write(
+        `rpc dispatch: unknown tabId=${msg.tabId} for cmd=${msg.cmd} — dropping\n`,
+      );
+      return;
+    }
+
+    if (msg.cmd === "abort") {
+      abortTurn(tab);
+      cancelPendingGates(tab);
+      return;
+    }
+    if (msg.cmd === "tab_close") {
+      void closeTab(tab);
+      return;
+    }
+    if (msg.cmd === "mcp_specs_get") {
+      emitMcpSpecs(tab);
+      return;
+    }
+    if (msg.cmd === "mcp_specs_add") {
+      const spec = msg.spec.trim();
+      if (!spec) {
+        emit({ type: "$error", message: "mcp_specs_add: spec is empty" }, tab.id);
+        return;
+      }
+      try {
+        parseMcpSpec(spec);
+      } catch (err) {
+        emit({ type: "$error", message: `mcp_specs_add: ${(err as Error).message}` }, tab.id);
+        return;
+      }
+      try {
+        const cfg = readConfig();
+        const list = cfg.mcp ?? [];
+        if (!list.includes(spec)) {
+          cfg.mcp = [...list, spec];
+          writeConfig(cfg);
+        }
+        emitMcpSpecs(tab);
+        void bridgeTabMcp(tab);
+      } catch (err) {
+        emit({ type: "$error", message: `mcp_specs_add: ${(err as Error).message}` }, tab.id);
+      }
+      return;
+    }
+    if (msg.cmd === "mcp_specs_remove") {
+      try {
+        const cfg = readConfig();
+        const list = cfg.mcp ?? [];
+        if (list.includes(msg.spec)) {
+          cfg.mcp = list.filter((s) => s !== msg.spec);
+          writeConfig(cfg);
+        }
+        tab.mcpStatuses.delete(msg.spec);
+        emitMcpSpecs(tab);
+        void bridgeTabMcp(tab);
+      } catch (err) {
+        emit({ type: "$error", message: `mcp_specs_remove: ${(err as Error).message}` }, tab.id);
+      }
+      return;
+    }
+    if (msg.cmd === "skills_get") {
+      emitSkills(tab);
+      return;
+    }
+    if (msg.cmd === "skill_run") {
+      if (!tab.runtime) {
+        emit(
+          {
+            type: "$error",
+            message: "No model provider is configured yet. Open Models settings to connect one.",
+          },
+          tab.id,
+        );
+        return;
+      }
+      try {
+        const store = new SkillStore({
+          projectRoot: tab.rootDir,
+          customSkillPaths: loadResolvedSkillPaths(tab.rootDir),
+        });
+        const found = store.read(msg.name);
+        if (!found) {
+          emit({ type: "$error", message: `skill not found: ${msg.name}` }, tab.id);
+          return;
+        }
+        const extra = msg.args?.trim() ?? "";
+        const header = `# Skill: ${found.name}${found.description ? `\n> ${found.description}` : ""}`;
+        const argsLine = extra ? `\n\nArguments: ${extra}` : "";
+        const payload = `${header}\n\n${found.body}${argsLine}`;
+        void runTurn(tab, payload);
+      } catch (err) {
+        emit({ type: "$error", message: `skill_run: ${(err as Error).message}` }, tab.id);
+      }
+      return;
+    }
+    if (msg.cmd === "session_list") {
+      emitSessions(tab);
+      return;
+    }
+    if (msg.cmd === "session_delete") {
+      deleteSession(msg.name);
+      emitSessions(tab);
+      return;
+    }
+    if (msg.cmd === "session_load") {
+      try {
+        const records = loadSessionMessages(msg.name);
+        const meta = loadSessionMeta(msg.name);
+        abortTurn(tab);
+        cancelPendingGates(tab);
+        tab.currentSession = msg.name;
+        if (tab.runtime) tab.runtime = buildRuntimeFor(tab);
+        const loadedMessages = buildLoadedMessages(records);
+        // Empty load is a known silent-failure path (file 0 bytes, all
+        // lines malformed, etc.). Log to stderr so a terminal-launched
+        // desktop reports something diagnostic, and emit a $session_empty
+        // event so the UI can surface "loaded but empty" instead of
+        // looking like the click did nothing. Issue #1179.
+        if (loadedMessages.length === 0) {
+          let sizeBytes = 0;
+          try {
+            sizeBytes = statSync(sessionPath(msg.name)).size;
+          } catch {
+            /* file may not exist */
+          }
+          process.stderr.write(
+            `session_load: "${msg.name}" returned 0 messages (file size=${sizeBytes}B) — empty or unreadable jsonl\n`,
+          );
+          emit({ type: "$session_empty", name: msg.name, sizeBytes }, tab.id);
+        }
+        emit(
+          {
+            type: "$session_loaded",
+            name: msg.name,
+            messages: loadedMessages,
+            carryover: {
+              totalCostUsd: meta.totalCostUsd ?? 0,
+              cacheHitTokens: meta.cacheHitTokens ?? 0,
+              cacheMissTokens: meta.cacheMissTokens ?? 0,
+            },
+          },
+          tab.id,
+        );
+      } catch (err) {
+        process.stderr.write(`session_load: "${msg.name}" threw — ${(err as Error).message}\n`);
+        emit({ type: "$error", message: `session_load failed: ${(err as Error).message}` }, tab.id);
+      }
+      return;
+    }
+    if (msg.cmd === "new_chat") {
+      abortTurn(tab);
+      cancelPendingGates(tab);
+      tab.currentSession = mintSessionFor(tab.rootDir);
+      if (tab.runtime) tab.runtime = buildRuntimeFor(tab);
+      emitSessions(tab);
+      return;
+    }
+    if (msg.cmd === "settings_get") {
+      emitSettings(tab);
+      return;
+    }
+    if (msg.cmd === "provider_probe") {
+      const apiKey =
+        msg.apiKey?.trim() ||
+        (msg.id
+          ? loadModelProviders().find((provider) => provider.id === msg.id)?.apiKey
+          : undefined);
+      void probeOpenAICompatibleProvider({ baseUrl: msg.baseUrl, apiKey }).then((result) => {
+        if (result.ok && msg.id) {
+          try {
+            saveModelProviderModels(msg.id, result.models);
+            for (const target of tabs.values()) emitSettings(target);
+          } catch {
+            // The provider may have been deleted while this asynchronous probe was in flight.
+          }
+        }
+        emit(
+          result.ok
+            ? {
+                type: "$provider_probe",
+                nonce: msg.nonce,
+                baseUrl: result.baseUrl,
+                ok: true,
+                models: result.models,
+                recommendedModel: result.recommendedModel,
+                providerName: result.providerName,
+                wireApi: result.wireApi,
+                saved: false,
+              }
+            : {
+                type: "$provider_probe",
+                nonce: msg.nonce,
+                baseUrl: result.baseUrl,
+                ok: false,
+                code: result.code,
+                message: result.message,
+                saved: false,
+              },
+          tab.id,
+        );
+      });
+      return;
+    }
+    if (msg.cmd === "provider_save") {
+      const kind = msg.kind ?? "custom";
+      const existing = msg.id
+        ? loadModelProviders().find((provider) => provider.id === msg.id)
+        : kind === "deepseek"
+          ? loadModelProviders().find((provider) => provider.id === "deepseek")
+          : undefined;
+      const apiKey = normalizeProviderApiKey(msg.apiKey || existing?.apiKey);
+      const model = msg.model.trim();
+      const name = msg.name.trim().slice(0, 80);
+      if (kind === "deepseek") {
+        try {
+          const baseUrl = normalizeProviderBaseUrl(
+            msg.baseUrl.trim() || "https://api.deepseek.com",
+          );
+          if (!baseUrl) throw new Error("Enter a valid HTTP(S) API base URL.");
+          const apiKeyError = providerApiKeyValidationError(apiKey);
+          if (apiKeyError) throw new Error(apiKeyError);
+          saveModelProvider({
+            id: "deepseek",
+            kind: "deepseek",
+            name: "DeepSeek",
+            apiKey,
+            baseUrl,
+            model: model || resolvePreset(msg.preset ?? "auto").model,
+            models: ["deepseek-v4-flash", "deepseek-v4-pro"],
+            preset: msg.preset ?? "auto",
+            reasoningEffortMax: msg.reasoningEffortMax ?? "max",
+            wireApi: "chat_completions",
+          });
+          applyActiveProviderToTabs();
+          emit(
+            {
+              type: "$provider_probe",
+              nonce: msg.nonce,
+              baseUrl,
+              ok: true,
+              models: [model],
+              saved: true,
+            },
+            tab.id,
+          );
+        } catch (error) {
+          emit(
+            {
+              type: "$provider_probe",
+              nonce: msg.nonce,
+              baseUrl: msg.baseUrl.trim() || "https://api.deepseek.com",
+              ok: false,
+              code: "save_failed",
+              message: error instanceof Error ? error.message : String(error),
+              saved: false,
+            },
+            tab.id,
+          );
+        }
+        return;
+      }
+      void probeOpenAICompatibleProvider({ baseUrl: msg.baseUrl, apiKey }).then((result) => {
+        if (!result.ok) {
+          emit(
+            {
+              type: "$provider_probe",
+              nonce: msg.nonce,
+              baseUrl: result.baseUrl,
+              ok: false,
+              code: result.code,
+              message: result.message,
+              saved: false,
+            },
+            tab.id,
+          );
+          return;
+        }
+        if (!model || !result.models.includes(model)) {
+          emit(
+            {
+              type: "$provider_probe",
+              nonce: msg.nonce,
+              baseUrl: result.baseUrl,
+              ok: false,
+              code: "model_not_found",
+              message: "Select a model returned by this provider before saving.",
+              models: result.models,
+              saved: false,
+            },
+            tab.id,
+          );
+          return;
+        }
+        try {
+          if (!apiKey) throw new Error("A provider API key is required.");
+          saveModelProvider({
+            id: msg.id,
+            kind: "custom",
+            name: name || result.providerName,
+            apiKey,
+            baseUrl: result.baseUrl,
+            model,
+            models: result.models,
+            reasoningEffortMax: msg.reasoningEffortMax ?? existing?.reasoningEffortMax ?? "auto",
+            wireApi: msg.wireApi ?? existing?.wireApi ?? "auto",
+          });
+          applyActiveProviderToTabs();
+          emit(
+            {
+              type: "$provider_probe",
+              nonce: msg.nonce,
+              baseUrl: result.baseUrl,
+              ok: true,
+              models: result.models,
+              recommendedModel: result.recommendedModel,
+              providerName: result.providerName,
+              wireApi: result.wireApi,
+              saved: true,
+            },
+            tab.id,
+          );
+        } catch (error) {
+          emit(
+            {
+              type: "$provider_probe",
+              nonce: msg.nonce,
+              baseUrl: result.baseUrl,
+              ok: false,
+              code: "save_failed",
+              message: error instanceof Error ? error.message : String(error),
+              saved: false,
+            },
+            tab.id,
+          );
+        }
+      });
+      return;
+    }
+    if (msg.cmd === "provider_activate") {
+      try {
+        activateModelProvider(msg.id);
+        applyActiveProviderToTabs();
+      } catch (error) {
+        emit(
+          { type: "$error", message: `provider activation failed: ${(error as Error).message}` },
+          tab.id,
+        );
+      }
+      return;
+    }
+    if (msg.cmd === "provider_delete") {
+      try {
+        deleteModelProvider(msg.id);
+        applyActiveProviderToTabs();
+      } catch (error) {
+        emit(
+          { type: "$error", message: `provider deletion failed: ${(error as Error).message}` },
+          tab.id,
+        );
+      }
+      return;
+    }
+    if (msg.cmd === "settings_save") {
+      try {
+        let activeProvider = loadActiveModelProvider();
+        let providerConfigChanged = false;
+        if (msg.reasoningEffort !== undefined) {
+          saveReasoningEffort(msg.reasoningEffort);
+          tab.runtime?.loop.configure({ reasoningEffort: msg.reasoningEffort });
+        }
+        if (msg.editMode !== undefined) saveEditMode(msg.editMode);
+        if (msg.budgetUsd !== undefined) {
+          tab.budgetUsd = msg.budgetUsd ?? undefined;
+          tab.runtime?.loop.setBudget(msg.budgetUsd);
+        }
+        if (msg.baseUrl !== undefined) {
+          activeProvider = { ...activeProvider, baseUrl: msg.baseUrl.trim() };
+          providerConfigChanged = true;
+        }
+        if (msg.customProviderName !== undefined) {
+          activeProvider = {
+            ...activeProvider,
+            name: msg.customProviderName.trim() || activeProvider.name,
+          };
+          providerConfigChanged = true;
+        }
+        if (msg.modelProvider !== undefined && msg.modelProvider !== activeProvider.kind) {
+          const requested = loadModelProviders().find(
+            (provider) => provider.kind === msg.modelProvider,
+          );
+          if (!requested) throw new Error(`No ${msg.modelProvider} provider is configured.`);
+          activateModelProvider(requested.id);
+          activeProvider = loadActiveModelProvider();
+          providerConfigChanged = true;
+        }
+        if (msg.workspaceDir !== undefined) {
+          void switchWorkspace(tab, msg.workspaceDir);
+          return;
+        }
+        if (msg.editor !== undefined) saveEditor(msg.editor);
+        if (msg.diagnosticsEnabled !== undefined) {
+          setDiagnosticsEnabled(msg.diagnosticsEnabled);
+        }
+        if (msg.preset !== undefined) {
+          const preset = canonicalPresetName(msg.preset);
+          activeProvider = {
+            ...activeProvider,
+            preset,
+            model:
+              activeProvider.kind === "deepseek"
+                ? resolvePreset(preset).model
+                : activeProvider.model,
+          };
+          providerConfigChanged = true;
+        }
+        if (msg.model !== undefined) {
+          const model = msg.model.trim();
+          if (!model) throw new Error("model must not be empty");
+          activeProvider = { ...activeProvider, model };
+          providerConfigChanged = true;
+        }
+        if (providerConfigChanged) {
+          saveModelProvider(activeProvider);
+          applyActiveProviderToTabs();
+        } else {
+          emitSettings(tab);
+        }
+      } catch (err) {
+        emit(
+          { type: "$error", message: `settings_save failed: ${(err as Error).message}` },
+          tab.id,
+        );
+      }
+      return;
+    }
+    if (msg.cmd === "mention_query") {
+      const nonce = msg.nonce;
+      const query = msg.query;
+      const parsed = parseAtQuery(query);
+      // Empty query → list workspace root's top-level entries (tree
+      // style). Without this, bare `@` floods with all 5000 files; the
+      // TUI's @+Tab pattern already shows the tree top.
+      const treeWalk = parsed.trailingSlash || query.length === 0;
+      if (treeWalk) {
+        void listDirectory(tab.rootDir, parsed.dir)
+          .then((entries) => {
+            const results = entries.map((e) => (e.isDir ? `${e.path}/` : e.path));
+            emit({ type: "$mention_results", nonce, query, results }, tab.id);
+          })
+          .catch((err) => {
+            emit(
+              { type: "$error", message: `mention_query (dir) failed: ${(err as Error).message}` },
+              tab.id,
+            );
+            emit({ type: "$mention_results", nonce, query, results: [] }, tab.id);
+          });
+        return;
+      }
+      const wantSymbols = query.length >= 2 && !query.includes("/");
+      void (async () => {
+        try {
+          const files = await getFileIndexFor(tab);
+          const fileResults = rankPickerCandidates(files, query, {
+            limit: wantSymbols ? 19 : 25,
+            recentlyUsed: tab.recentMentions,
+          });
+          let symResults: string[] = [];
+          if (wantSymbols) {
+            const syms = await getSymbolIndexFor(tab);
+            symResults = rankSymbols(syms, query, 6);
+          }
+          emit(
+            { type: "$mention_results", nonce, query, results: [...symResults, ...fileResults] },
+            tab.id,
+          );
+        } catch (err) {
+          emit(
+            { type: "$error", message: `mention_query failed: ${(err as Error).message}` },
+            tab.id,
+          );
+          emit({ type: "$mention_results", nonce, query, results: [] }, tab.id);
+        }
+      })();
+      return;
+    }
+    if (msg.cmd === "mention_picked") {
+      pushMentionRecent(tab, msg.path);
+      return;
+    }
+    if (msg.cmd === "mention_preview") {
+      const nonce = msg.nonce;
+      const rel = msg.path;
+      const abs = isAbsolute(rel) ? rel : join(tab.rootDir, rel);
+      const safeAbs = resolve(abs);
+      const safeRoot = resolve(tab.rootDir);
+      if (!safeAbs.startsWith(safeRoot)) {
+        emit({ type: "$mention_preview", nonce, path: rel, head: "", totalLines: 0 }, tab.id);
+        return;
+      }
+      void readFile(safeAbs, "utf8")
+        .then((text) => {
+          const lines = text.split(/\r?\n/);
+          if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+          const head = lines.slice(0, 12).join("\n");
+          emit(
+            { type: "$mention_preview", nonce, path: rel, head, totalLines: lines.length },
+            tab.id,
+          );
+        })
+        .catch(() => {
+          emit({ type: "$mention_preview", nonce, path: rel, head: "", totalLines: 0 }, tab.id);
+        });
+      return;
+    }
+    if (msg.cmd === "user_input") {
+      if (!tab.runtime) {
+        emit(
+          {
+            type: "$error",
+            message: "No model provider is configured yet. Open Models settings to connect one.",
+          },
+          tab.id,
+        );
+        return;
+      }
+      void runTurn(tab, msg.text);
+    }
+  });
+
+  await new Promise<void>((resolve) => {
+    rl.on("close", () => {
+      void gracefulShutdown();
+      resolve();
+    });
+  });
+}

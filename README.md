@@ -1,0 +1,115 @@
+# Silicon Code
+
+Silicon Code 是一款类似 Claude Code 的代码开发工具，也是中国第一个基于 DeepSeek 的代码开发工具，Token 成本节省 90% 以上。它可以实现自动任务拆分、自动开发、MCP 测试，以及与 Claude、Codex 等多 Agent 协作，能力接近 Claude Sonnet 4.6。
+
+在项目目录中启动后，它会读取并搜索你的代码、提出修改方案并以 diff 展示、在运行 shell 命令前征求你的确认、按需运行测试验证，并为每次会话留下简洁的记录。
+
+English: [README.en.md](README.en.md)
+
+## 安装
+
+要求 Node.js 22 或更新版本。
+
+```bash
+npm install -g @brownsweet/siliconcode
+cd path/to/project
+brown
+```
+
+Windows PowerShell 运行 `npm` 命令时，如果提示 `npm.ps1` 被禁止执行，请改用 `npm.cmd`，例如：
+
+```powershell
+npm.cmd install
+npm.cmd run dev
+npm.cmd run verify
+```
+
+短命令：
+
+```bash
+brown
+```
+
+不全局安装也可以临时运行：
+
+```bash
+npx @brownsweet/siliconcode
+```
+
+## 常用命令
+
+| 命令 | 用途 |
+| --- | --- |
+| `brown` | 在当前项目目录启动编码智能体（等同 `brown code`）。 |
+| `brown code [dir]` | 在指定目录 `[dir]` 启动编码智能体；省略 `[dir]` 即为当前目录。 |
+| `brown chat` | 不带文件系统和 shell 工具的纯聊天。 |
+| `brown run "task"` | 非交互式执行一次任务。 |
+| `brown init [dir]` | 分析项目并生成 `SILICON.md` 项目指南。 |
+| `brown doctor` | 本地环境健康检查。 |
+| `brown update` | 检查并安装最新 CLI 包。 |
+
+Silicon Code 也安装 `brown`。默认不会安装 `cc`，因为这个名字通常是系统 C 编译器。
+
+## 配置
+
+用户配置文件位置：
+
+```text
+~/.siliconcode/config.json
+```
+
+可以通过首次运行向导配置 DeepSeek API Key，也可以直接导出环境变量：
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+```
+
+项目规则建议写在仓库里的 `AGENTS.md` 或 `SILICON.md`。
+
+模型预设使用当前 DeepSeek V4 API ID：`flash` 对应 `deepseek-v4-flash`，
+`pro` 对应 `deepseek-v4-pro`，`auto` 默认从 Flash 开始，并在困难回合一次性升级
+到 Pro。
+
+桌面端也支持标准 OpenAI 兼容提供方。在“设置 -> 模型 -> 添加模型提供方”中先填写
+Base URL 和 API Key，应用会自动读取 `/models`、推荐模型，并在 Responses API 与
+Chat Completions API 之间安全适配。服务端返回的新模型可以直接使用，不会因为未在
+本地能力表登记而阻断。完整行为、安全边界和验收方式见
+[OpenAI 兼容提供方文档](docs/OPENAI-COMPATIBLE-PROVIDERS.md)。
+
+### 错误诊断
+
+Silicon Code 默认收集并上传经过脱敏的 `error`/`fatal` 错误元数据和堆栈，用于定位发布版本故障。不会上传对话、模型输出、文件内容、完整命令参数、API Key、令牌、Cookie 或环境变量值。网络不可用时，事件会暂存在 `~/.siliconcode/diagnostics/pending/`，队列有数量和大小上限。
+
+可在桌面端“设置 -> 通用 -> 错误诊断”中关闭，也可通过配置或环境变量关闭：
+
+```json
+{
+  "diagnostics": { "enabled": false }
+}
+```
+
+```bash
+export SILICONCODE_DIAGNOSTICS=off
+```
+
+初始化已有项目的规则文件：
+
+```bash
+brown init
+brown init --dry-run
+brown init --force --yes
+```
+
+该命令只读取仓库中的 manifest、目录和工具配置，不调用模型。已有规则文件默认
+不会被覆盖；可先使用 `--dry-run` 查看差异，再显式传入 `--force`。
+
+## 许可与归因
+
+Silicon Code 使用 MIT 许可证。
+
+第三方 MIT 声明保留在：
+
+- `THIRD_PARTY_NOTICES.md`
+- `LICENSES/`
+
+不要移除派生源码中的 copyright 或 MIT notice。

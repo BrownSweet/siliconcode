@@ -1,0 +1,361 @@
+import type { DeepSeekClient } from "./client.js";
+import { Usage } from "./client.js";
+import { healLoadedMessages } from "./loop.js";
+import { thinkingModeForModel } from "./loop.js";
+import { stripHallucinatedToolMarkup } from "./loop.js";
+import { buildAssistantMessage } from "./loop/messages.js";
+import { DEFAULT_MAX_RESULT_CHARS } from "./mcp/registry.js";
+import type { AppendOnlyLog } from "./memory/runtime.js";
+import { rewriteSession } from "./memory/session.js";
+import { SUMMARY_MODEL_ID, type ThinkingPreference } from "./models.js";
+import { type SessionStats, contextTokensFor } from "./telemetry/stats.js";
+import {
+  countTokensBounded,
+  estimateConversationTokens,
+  estimateRequestTokens,
+} from "./tokenizer.js";
+import type { ChatMessage } from "./types.js";
+
+/** Auto-fold when a turn's response shows promptTokens above this fraction of ctxMax. */
+export const HISTORY_FOLD_THRESHOLD = 0.5;
+/** Tail budget after a normal fold, as a fraction of ctxMax. */
+export const HISTORY_FOLD_TAIL_FRACTION = 0.2;
+/** Above this fraction the normal fold's tail budget didn't buy enough headroom — fold harder. */
+export const HISTORY_FOLD_AGGRESSIVE_THRESHOLD = 0.7;
+/** Tail budget after an aggressive fold — half the normal one, sacrifices recent context for headroom. */
+export const HISTORY_FOLD_AGGRESSIVE_TAIL_FRACTION = 0.1;
+/** Skip the fold if the head wouldn't shrink the log by at least this fraction. */
+export const HISTORY_FOLD_MIN_SAVINGS_FRACTION = 0.3;
+/** Above this fraction we exit the turn with a summary instead of folding (defense in depth). */
+export const FORCE_SUMMARY_THRESHOLD = 0.8;
+/** Local preflight estimate above this fraction trips the emergency in-place compact path. */
+export const PREFLIGHT_EMERGENCY_THRESHOLD = 0.95;
+/** Emergency preflight target after local truncation, as a fraction of ctxMax. */
+export const PREFLIGHT_MECHANICAL_TARGET_FRACTION = 0.7;
+/** Hard deadline for semantic fold summaries so a hung request cannot stall the turn loop. */
+export const HISTORY_FOLD_SUMMARY_TIMEOUT_MS = 15_000;
+/** Prepended to fold summary content so the model knows it's a synthesized recap. */
+export const HISTORY_FOLD_MARKER =
+  "[CONVERSATION HISTORY SUMMARY — earlier turns folded for context efficiency]\n\n";
+/** Header that precedes preserved skill bodies in a fold's synthesized assistant message. */
+export const SKILL_PIN_MEMO_HEADER = "[Active skill memos — preserved verbatim across the fold:]";
+/** Matches the wrapper emitted by `run_skill` so the fold can lift bodies out before summarizing. */
+const SKILL_PIN_REGEX = /<skill-pin name="([^"]+)">\n[\s\S]*?\n<\/skill-pin>/g;
+
+export interface ContextManagerDeps {
+  client: DeepSeekClient;
+  log: AppendOnlyLog;
+  stats: SessionStats;
+  sessionName: string | null;
+  getAbortSignal: () => AbortSignal;
+  getCurrentTurn: () => number;
+  getThinkingPreference: () => ThinkingPreference;
+}
+
+export type PostUsageDecisionKind = "none" | "fold" | "exit-with-summary";
+
+export interface PostUsageDecision {
+  kind: PostUsageDecisionKind;
+  promptTokens: number;
+  ctxMax: number;
+  ratio: number;
+  /** Token budget for the recent tail when kind === "fold"; smaller in the aggressive band. */
+  tailBudget?: number;
+  /** True when this fold is in the 70-85% band — used in user-facing messaging. */
+  aggressive?: boolean;
+}
+
+export interface PreflightDecision {
+  needsAction: boolean;
+  estimateTokens: number;
+  ctxMax: number;
+}
+
+export interface FoldResult {
+  folded: boolean;
+  beforeMessages: number;
+  afterMessages: number;
+  summaryChars: number;
+}
+
+// Stub pins in head so the summarizer doesn't paraphrase them; dedupe by name, last invocation wins.
+function extractPinnedSkills(head: ChatMessage[]): {
+  stubbedHead: ChatMessage[];
+  pinnedBodies: string[];
+} {
+  const pinned = new Map<string, string>();
+  const stubbedHead = head.map((msg) => {
+    if (typeof msg.content !== "string") return msg;
+    let hit = false;
+    const next = msg.content.replace(SKILL_PIN_REGEX, (full, name: string) => {
+      pinned.delete(name);
+      pinned.set(name, full);
+      hit = true;
+      return `[skill ${JSON.stringify(name)} memo — preserved separately, do not summarize.]`;
+    });
+    return hit ? { ...msg, content: next } : msg;
+  });
+  return { stubbedHead, pinnedBodies: [...pinned.values()] };
+}
+
+export class ContextManager {
+  constructor(private deps: ContextManagerDeps) {}
+
+  replaceClient(client: DeepSeekClient): void {
+    this.deps.client = client;
+  }
+
+  /** Decision after a turn's response — fold, exit with summary, or carry on. */
+  decideAfterUsage(
+    usage: Usage | null,
+    model: string,
+    alreadyFoldedThisTurn: boolean,
+  ): PostUsageDecision {
+    const ctxMax = contextTokensFor(model);
+    if (!usage) return { kind: "none", promptTokens: 0, ctxMax, ratio: 0 };
+    const ratio = usage.promptTokens / ctxMax;
+    const base = { promptTokens: usage.promptTokens, ctxMax, ratio };
+    if (ratio > FORCE_SUMMARY_THRESHOLD) {
+      return { kind: "exit-with-summary", ...base };
+    }
+    if (alreadyFoldedThisTurn) return { kind: "none", ...base };
+    if (ratio > HISTORY_FOLD_AGGRESSIVE_THRESHOLD) {
+      return {
+        kind: "fold",
+        ...base,
+        tailBudget: Math.floor(ctxMax * HISTORY_FOLD_AGGRESSIVE_TAIL_FRACTION),
+        aggressive: true,
+      };
+    }
+    if (ratio > HISTORY_FOLD_THRESHOLD) {
+      return {
+        kind: "fold",
+        ...base,
+        tailBudget: Math.floor(ctxMax * HISTORY_FOLD_TAIL_FRACTION),
+        aggressive: false,
+      };
+    }
+    return { kind: "none", ...base };
+  }
+
+  /** Local-side preflight before sending a request — catches oversized payloads early. */
+  decidePreflight(
+    messages: ChatMessage[],
+    toolSpecs: ReadonlyArray<unknown> | undefined | null,
+    model: string,
+  ): PreflightDecision {
+    const ctxMax = contextTokensFor(model);
+    const estimate = estimateRequestTokens(messages, toolSpecs ?? null, true);
+    return {
+      needsAction: estimate / ctxMax > PREFLIGHT_EMERGENCY_THRESHOLD,
+      estimateTokens: estimate,
+      ctxMax,
+    };
+  }
+
+  /** Replace older turns with one summary message; keep tail within keepRecentTokens budget. */
+  async fold(model: string, opts?: { keepRecentTokens?: number }): Promise<FoldResult> {
+    const ctxMax = contextTokensFor(model);
+    const tailBudget = opts?.keepRecentTokens ?? Math.floor(ctxMax * HISTORY_FOLD_TAIL_FRACTION);
+    const all = this.deps.log.toMessages();
+    const noop: FoldResult = {
+      folded: false,
+      beforeMessages: all.length,
+      afterMessages: all.length,
+      summaryChars: 0,
+    };
+    if (all.length === 0) return noop;
+
+    // Per-message content-only comparison for fold ordering (not exact API match).
+    const tokenCounts = all.map((m) => countTokensBounded(m.content ?? ""));
+    const totalTokens = tokenCounts.reduce((a, b) => a + b, 0);
+
+    let cumTokens = 0;
+    let boundary = all.length;
+    for (let i = all.length - 1; i >= 0; i--) {
+      if (cumTokens + tokenCounts[i]! > tailBudget) break;
+      cumTokens += tokenCounts[i]!;
+      if (all[i]!.role === "user") boundary = i;
+    }
+    if (boundary <= 0) return noop;
+
+    const head = all.slice(0, boundary);
+    const tail = all.slice(boundary);
+    const headTokens = totalTokens - cumTokens;
+    if (headTokens < totalTokens * HISTORY_FOLD_MIN_SAVINGS_FRACTION) return noop;
+
+    const { stubbedHead, pinnedBodies } = extractPinnedSkills(head);
+    const summary = await this.summarizeForFold(stubbedHead);
+    if (!summary.content) return noop;
+
+    const memoTail =
+      pinnedBodies.length > 0 ? `\n\n${SKILL_PIN_MEMO_HEADER}\n\n${pinnedBodies.join("\n\n")}` : "";
+    // Route via buildAssistantMessage so the synthetic summary carries
+    // reasoning_content under thinking-mode sessions — without it the
+    // next API call 400s with "must be passed back" (#1042). Stamp uses
+    // the SESSION model so an empty placeholder is added even when the
+    // summarizer call somehow returned no reasoning.
+    const summaryMsg = buildAssistantMessage(
+      HISTORY_FOLD_MARKER + summary.content + memoTail,
+      [],
+      model,
+      summary.reasoningContent,
+      this.deps.getThinkingPreference(),
+    );
+    const replacement = [summaryMsg, ...tail];
+    this.deps.log.compactInPlace(replacement);
+    this.persistRewrite(replacement);
+    return {
+      folded: true,
+      beforeMessages: all.length,
+      afterMessages: replacement.length,
+      summaryChars: summary.content.length,
+    };
+  }
+
+  /** Pure local emergency compaction for preflight: drop oldest log entries and keep a valid tail. */
+  mechanicalTruncate(
+    model: string,
+    opts?: { targetTokens?: number; allowEmpty?: boolean },
+  ): FoldResult {
+    const ctxMax = contextTokensFor(model);
+    const targetTokens =
+      opts?.targetTokens ?? Math.floor(ctxMax * PREFLIGHT_MECHANICAL_TARGET_FRACTION);
+    const all = this.deps.log.toMessages();
+    const noop: FoldResult = {
+      folded: false,
+      beforeMessages: all.length,
+      afterMessages: all.length,
+      summaryChars: 0,
+    };
+    if (all.length === 0) return noop;
+
+    const tokenCounts = all.map((m) => estimateConversationTokens([m], true));
+    let latestUserBoundary = -1;
+    for (let i = all.length - 1; i >= 0; i--) {
+      if (all[i]!.role === "user") {
+        latestUserBoundary = i;
+        break;
+      }
+    }
+    let cumTokens = 0;
+    let boundary = all.length;
+    let foundSafeBoundary = false;
+    for (let i = all.length - 1; i >= 0; i--) {
+      const next = cumTokens + tokenCounts[i]!;
+      if (next > targetTokens) break;
+      cumTokens = next;
+      if (all[i]!.role === "user") {
+        boundary = i;
+        foundSafeBoundary = true;
+      }
+    }
+    if (boundary <= 0) return noop;
+
+    const replacement = foundSafeBoundary
+      ? all.slice(boundary)
+      : opts?.allowEmpty
+        ? []
+        : latestUserBoundary >= 0
+          ? all.slice(latestUserBoundary)
+          : all;
+    if (replacement.length === all.length) return noop;
+    this.deps.log.compactInPlace(replacement);
+    this.persistRewrite(replacement);
+    return {
+      folded: true,
+      beforeMessages: all.length,
+      afterMessages: replacement.length,
+      summaryChars: 0,
+    };
+  }
+
+  /** Drop a trailing in-flight assistant-with-tool_calls before a forced summary. Tail-only mutation; prefix cache safe. */
+  trimTrailingToolCalls(): boolean {
+    const tail = this.deps.log.entries[this.deps.log.entries.length - 1];
+    if (
+      !tail ||
+      tail.role !== "assistant" ||
+      !Array.isArray(tail.tool_calls) ||
+      tail.tool_calls.length === 0
+    ) {
+      return false;
+    }
+    const kept = this.deps.log.entries.slice(0, -1);
+    this.deps.log.compactInPlace([...kept]);
+    this.persistRewrite([...kept]);
+    return true;
+  }
+
+  private async summarizeForFold(
+    messagesToSummarize: ChatMessage[],
+  ): Promise<{ content: string; reasoningContent: string }> {
+    const summaryModel = SUMMARY_MODEL_ID;
+    const systemPrompt =
+      "You compress conversation history for a coding agent. Output one prose recap that preserves: the user's overall goal, decisions and conclusions reached, files inspected or modified, important tool results still relevant to ongoing work, and any open todos. Skip turn-by-turn play-by-play. No tool calls, no markdown headings, no SEARCH/REPLACE blocks — plain prose only.";
+    const healed = healLoadedMessages(messagesToSummarize, DEFAULT_MAX_RESULT_CHARS).messages;
+    const messages: ChatMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...healed,
+      {
+        role: "user",
+        content:
+          "Summarize the conversation above as plain prose. This summary replaces the original turns to free context — make it self-contained.",
+      },
+    ];
+    const turnSignal = this.deps.getAbortSignal();
+    const foldCtrl = new AbortController();
+    let cleanupAbort = (): void => {};
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const abortPromise = new Promise<never>((_, reject) => {
+        const abort = () => {
+          foldCtrl.abort();
+          reject(new Error("fold-aborted"));
+        };
+        if (turnSignal.aborted) {
+          abort();
+        } else {
+          turnSignal.addEventListener("abort", abort, { once: true });
+          cleanupAbort = () => turnSignal.removeEventListener("abort", abort);
+        }
+      });
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          foldCtrl.abort();
+          reject(new Error("fold-timeout"));
+        }, HISTORY_FOLD_SUMMARY_TIMEOUT_MS);
+      });
+      const resp = await Promise.race([
+        this.deps.client.chat({
+          model: summaryModel,
+          messages,
+          signal: foldCtrl.signal,
+          thinking: thinkingModeForModel(summaryModel),
+          reasoningEffort: "high",
+        }),
+        abortPromise,
+        timeoutPromise,
+      ]);
+      this.deps.stats.record(this.deps.getCurrentTurn(), summaryModel, resp.usage ?? new Usage());
+      return {
+        content: stripHallucinatedToolMarkup((resp.content ?? "").trim()),
+        reasoningContent: resp.reasoningContent ?? "",
+      };
+    } catch {
+      return { content: "", reasoningContent: "" };
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      cleanupAbort();
+    }
+  }
+
+  private persistRewrite(messages: ChatMessage[]): void {
+    if (!this.deps.sessionName) return;
+    try {
+      rewriteSession(this.deps.sessionName, messages);
+    } catch {
+      /* disk full / perms — in-memory mutation still applies */
+    }
+  }
+}

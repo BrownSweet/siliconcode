@@ -1,0 +1,1676 @@
+/** Library reads only DEEPSEEK_API_KEY from env; the CLI bridges config.json → env var. */
+
+import { randomUUID } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { type ThemeName, isThemeName, resolveThemeName } from "./cli/ui/theme/tokens.js";
+import type { LanguageCode } from "./i18n/types.js";
+import {
+  type IndexUserConfig,
+  type ResolvedIndexConfig,
+  resolveIndexConfig,
+} from "./index/config.js";
+import { type McpServerSpec, parseMcpSpec } from "./mcp/spec.js";
+import type { McpToolProfile } from "./mcp/tool-profile.js";
+import { type ThinkingPreference, migrateRetiredModel } from "./models.js";
+import { normalizeQQAllowlist, normalizeQQOpenId } from "./qq/access.js";
+
+/** Legacy `fast|smart|max` kept for back-compat with existing config.json files. */
+export type PresetName = "auto" | "flash" | "pro" | "fast" | "smart" | "max";
+
+/** Single trust dial: review queues edits + gates shell; auto applies + gates shell; yolo skips both gates. */
+export type EditMode = "review" | "auto" | "yolo";
+
+export type ReasoningEffort = "high" | "max";
+
+export type EmbeddingProvider = "ollama" | "openai-compat";
+
+export interface OllamaEmbeddingUserConfig {
+  baseUrl?: string;
+  model?: string;
+}
+
+export interface OpenAICompatEmbeddingUserConfig {
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+  extraBody?: Record<string, unknown>;
+  batchSize?: number;
+}
+
+export interface SemanticEmbeddingUserConfig {
+  provider?: EmbeddingProvider;
+  ollama?: OllamaEmbeddingUserConfig;
+  openaiCompat?: OpenAICompatEmbeddingUserConfig;
+}
+
+export interface ResolvedOllamaEmbeddingConfig {
+  provider: "ollama";
+  baseUrl: string;
+  model: string;
+  timeoutMs: number;
+}
+
+export interface ResolvedOpenAICompatEmbeddingConfig {
+  provider: "openai-compat";
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  extraBody: Record<string, unknown>;
+  timeoutMs: number;
+  batchSize: number;
+}
+
+export type ResolvedEmbeddingConfig =
+  | ResolvedOllamaEmbeddingConfig
+  | ResolvedOpenAICompatEmbeddingConfig;
+
+export interface SemanticEmbeddingConfigView {
+  provider: EmbeddingProvider;
+  ollama: {
+    baseUrl: string;
+    model: string;
+  };
+  openaiCompat: {
+    baseUrl: string;
+    apiKey: string;
+    apiKeySet: boolean;
+    model: string;
+    extraBody: Record<string, unknown>;
+    batchSize: number;
+  };
+}
+
+export interface McpServerConfig {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  transport?: "stdio" | "sse" | "streamable-http";
+  url?: string;
+  headers?: Record<string, string>;
+  disabled?: boolean;
+}
+
+export interface QQBotConfig {
+  appId?: string;
+  appSecret?: string;
+  sandbox?: boolean;
+  enabled?: boolean;
+  ownerOpenId?: string;
+  allowlist?: string[];
+}
+
+export interface PricingOverride {
+  inputCacheHit?: number;
+  inputCacheMiss?: number;
+  output?: number;
+}
+
+export interface RateLimitConfig {
+  rpm?: number;
+}
+
+export interface DiagnosticsUserConfig {
+  /** Error-only diagnostics. Defaults to true; set false to stop capture and upload. */
+  enabled?: boolean;
+  /** Override for self-hosted collectors and development. */
+  endpoint?: string;
+}
+
+export type ModelProviderKind = "deepseek" | "custom";
+
+/** Wire protocol used by an OpenAI-compatible provider. */
+export type ProviderWireApi = "auto" | "chat_completions" | "responses";
+
+/** Provider reasoning ceiling; `auto` learns from explicit 400/422 validation responses. */
+export type ProviderReasoningEffortMax = "auto" | "none" | "high" | "xhigh" | "max";
+
+export interface ModelProviderConfig {
+  /** Stable identifier used by the desktop UI and session runtime. */
+  id: string;
+  kind: ModelProviderKind;
+  name: string;
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  /** Agent-capable models discovered from this provider's model catalog. */
+  models?: string[];
+  preset?: PresetName;
+  /** Highest reasoning_effort value accepted by this endpoint. */
+  reasoningEffortMax?: ProviderReasoningEffortMax;
+  /** OpenAI-compatible request protocol. Custom providers default to auto. */
+  wireApi?: ProviderWireApi;
+}
+
+export interface ActiveModelProvider extends ModelProviderConfig {
+  apiKey?: string;
+  baseUrl: string;
+  model?: string;
+  reasoningEffortMax: ProviderReasoningEffortMax;
+  wireApi: ProviderWireApi;
+}
+
+export interface ReasonixConfig {
+  apiKey?: string;
+  baseUrl?: string;
+  /** Explicit chat model pin. When absent, the selected preset supplies the model. */
+  model?: string;
+  /** Display label for the currently configured OpenAI-compatible provider. */
+  customProviderName?: string;
+  /** Explicit provider identity; legacy configs are inferred from endpoint and model. */
+  modelProvider?: ModelProviderKind;
+  /** Persisted provider registry. Legacy single-provider fields are migrated on first mutation. */
+  modelProviders?: ModelProviderConfig[];
+  /** Stable id from modelProviders; `deepseek` is the built-in provider. */
+  activeModelProviderId?: string;
+  lang?: LanguageCode;
+  preset?: PresetName;
+  editMode?: EditMode;
+  editModeHintShown?: boolean;
+  mouseClipboardHintShown?: boolean;
+  /** When true, the composer starts in vim NORMAL mode and exposes vim editing. Default false. */
+  vimMode?: boolean;
+  /** When false, skip the boot splash animation and show the main UI immediately. Default true. */
+  banner?: boolean;
+  /** When false, skip the non-blocking npm latest check shown at startup. Default true. */
+  updateCheck?: boolean;
+  /** When false, only notify about a new version instead of auto-installing it in the background. Default true. */
+  autoUpdate?: boolean;
+  /** Reply verbosity style injected into the system prompt (applies next session). Default "default". */
+  outputStyle?: OutputStyle;
+  reasoningEffort?: ReasoningEffort;
+  /** V4 thinking mode. "auto" follows the selected model's default. */
+  thinkingMode?: ThinkingPreference;
+  /** Optional response token cap. Must be a positive integer. */
+  maxOutputTokens?: number;
+  /** Optional stable, non-PII provider scheduling/cache-isolation identifier. */
+  userId?: string;
+  /** Default workspace root for the desktop client. CLI uses cwd. */
+  workspaceDir?: string;
+  /** Last N workspace paths the desktop client has opened, most recent first. */
+  recentWorkspaces?: string[];
+  /** Desktop only — workspace dir per open tab in tab order, persisted so restart restores every tab (issue #933). Empty/absent → boot with a single default tab. */
+  desktopOpenTabs?: string[];
+  /** Desktop only — `openWith` value for clicking file links. Empty/undefined = OS default app. Examples: "code", "cursor", "C:\\path\\to\\editor.exe". */
+  editor?: string;
+  theme?: ThemeName | "auto";
+  /** Stored as `--mcp`-format strings so one parser handles both flag and config. */
+  mcp?: string[];
+  /** Names of servers in `mcp` to skip on bridge — see `/mcp disable <name>`. */
+  mcpDisabled?: string[];
+  /** Env overlay per MCP server name (matches the `name=` prefix of the spec). Stdio transports merge this over process.env; SSE/HTTP ignore it. */
+  mcpEnv?: Record<string, Record<string, string>>;
+  /** Canonical MCP server configuration — merges with and overrides legacy `mcp`/`mcpEnv`/`mcpDisabled`. */
+  mcpServers?: Record<string, McpServerConfig>;
+  /** Tool exposure policy for code mode. "auto" removes native duplicates and test servers. */
+  mcpToolProfile?: McpToolProfile;
+  session?: string | null;
+  setupCompleted?: boolean;
+  search?: boolean;
+  /** Web search engine backend: "metaso" (default, Metaso API — reachable from mainland China), "mojeek" (scrapes Mojeek), or "searxng" (self-hosted SearXNG). */
+  webSearchEngine?: "mojeek" | "searxng" | "metaso";
+  /** Base URL for SearXNG instance (default http://localhost:8080). */
+  webSearchEndpoint?: string;
+  /** Metaso API key. Falls back to METASO_API_KEY env var, then a built-in default. */
+  metasoApiKey?: string;
+  dashboard?: {
+    /** Pin the embedded dashboard to a fixed port — required for stable SSH tunnels. 0/absent → ephemeral. */
+    port?: number;
+    /** Bind address (#968). Defaults to 127.0.0.1 (loopback only). Set to 0.0.0.0 / :: / a LAN IP to expose to other devices; the URL token is then the only auth, so keep it secret. */
+    host?: string;
+    /** Stable URL token (#968). If unset, a fresh token is minted each boot. Min 16 chars enforced at load time. */
+    token?: string;
+  };
+  /** Per-field visibility toggles for the bottom status row. Codex-style defaults keep only turn cost and context visible. */
+  statusBar?: {
+    showMode?: boolean;
+    showPreset?: boolean;
+    showSessionInfo?: boolean;
+    showBalance?: boolean;
+    showSessionCost?: boolean;
+    showTurnCost?: boolean;
+    showCacheHit?: boolean;
+    showCtxUsage?: boolean;
+    showVersion?: boolean;
+    showFeedbackHint?: boolean;
+  };
+  projects?: {
+    [absoluteRootDir: string]: {
+      shellAllowed?: string[];
+      /** Absolute directory prefixes the user pre-approved for outside-sandbox file access (#684). */
+      pathAllowed?: string[];
+    };
+  };
+  /** Issue #259 — user-configurable sensitive-path prefixes and filename patterns.
+   *  Commands touching these paths are demoted to the confirm gate even when allowlisted. */
+  sensitivePaths?: {
+    /** Path prefixes (tilde-relative or absolute) that trigger confirmation. */
+    prefixes?: string[];
+    /** Glob-style filename patterns (matched against basename, case-insensitive). */
+    patterns?: string[];
+  };
+  index?: IndexUserConfig;
+  semantic?: SemanticEmbeddingUserConfig;
+  skills?: {
+    paths?: string[];
+  };
+  /** User-declared extensions to the built-in memory types (#709). Unknown types round-trip even without a declaration; declaring one lets you attach a default priority + lifecycle. */
+  memory?: {
+    customTypes?: CustomMemoryTypeConfig[];
+  };
+  pricingOverride?: Record<string, PricingOverride>;
+  /** Prompt context-window overrides for custom or renamed provider models. */
+  contextWindowOverride?: Record<string, number>;
+  rateLimit?: RateLimitConfig;
+  diagnostics?: DiagnosticsUserConfig;
+  /** QQ Bot configuration */
+  qq?: QQBotConfig;
+}
+
+/** Silicon-branded name for the user configuration schema. */
+export type SiliconCodeConfig = ReasonixConfig;
+
+export interface CustomMemoryTypeConfig {
+  name: string;
+  description?: string;
+  priority?: "low" | "medium" | "high";
+  expires?: "project_end";
+}
+
+export interface MemoryTypeRegistryEntry {
+  name: string;
+  builtin: boolean;
+  description?: string;
+  priority?: "low" | "medium" | "high";
+  expires?: "project_end";
+}
+
+const BUILTIN_TYPE_DOCS: Record<string, string> = {
+  user: "role / skills / preferences",
+  feedback: "corrections or confirmed approaches",
+  project: "facts / decisions about the current work",
+  reference: "pointers to external systems the user uses",
+};
+
+/** Resolve the merged registry of memory types — built-ins, overlaid by anything in `config.memory.customTypes`. */
+export function loadMemoryTypeRegistry(
+  cfg: ReasonixConfig = readConfig(),
+): MemoryTypeRegistryEntry[] {
+  const out: MemoryTypeRegistryEntry[] = [];
+  for (const name of ["user", "feedback", "project", "reference"]) {
+    out.push({ name, builtin: true, description: BUILTIN_TYPE_DOCS[name] });
+  }
+  const seen = new Set(out.map((e) => e.name));
+  for (const raw of cfg.memory?.customTypes ?? []) {
+    if (!raw || typeof raw.name !== "string") continue;
+    const name = raw.name.trim();
+    if (!name || !/^[a-zA-Z][a-zA-Z0-9_-]{0,31}$/.test(name)) continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const entry: MemoryTypeRegistryEntry = { name, builtin: false };
+    if (typeof raw.description === "string") entry.description = raw.description;
+    if (raw.priority === "low" || raw.priority === "medium" || raw.priority === "high") {
+      entry.priority = raw.priority;
+    }
+    if (raw.expires === "project_end") entry.expires = raw.expires;
+    out.push(entry);
+  }
+  return out;
+}
+
+export function memoryTypeDefaults(
+  typeName: string,
+  cfg: ReasonixConfig = readConfig(),
+): { priority?: "low" | "medium" | "high"; expires?: "project_end" } {
+  const found = loadMemoryTypeRegistry(cfg).find((e) => e.name === typeName);
+  if (!found) return {};
+  const out: { priority?: "low" | "medium" | "high"; expires?: "project_end" } = {};
+  if (found.priority) out.priority = found.priority;
+  if (found.expires) out.expires = found.expires;
+  return out;
+}
+
+const DEFAULT_METASO_API_KEY = "mk-E384C1DD5E8501BB7EFE27C949AFDE5B";
+
+export function loadMetasoApiKey(path: string = defaultConfigPath()): string {
+  if (process.env.METASO_API_KEY) return process.env.METASO_API_KEY;
+  const cfg = readConfig(path).metasoApiKey;
+  if (cfg && typeof cfg === "string" && cfg.trim()) return cfg.trim();
+  return DEFAULT_METASO_API_KEY;
+}
+
+const DEFAULT_OLLAMA_URL = "http://localhost:11434";
+const DEFAULT_EMBED_MODEL = "nomic-embed-text";
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_BATCH_SIZE = 10;
+
+export function resolveSemanticOllamaModelEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  return env.SILICONCODE_EMBED_MODEL ?? env.REASONIX_EMBED_MODEL;
+}
+
+export function defaultConfigPath(): string {
+  return join(homedir(), ".siliconcode", "config.json");
+}
+
+export function readConfig(path: string = defaultConfigPath()): ReasonixConfig {
+  try {
+    const raw = readFileSync(path, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") return parsed as ReasonixConfig;
+  } catch {
+    /* missing or malformed → empty config */
+  }
+  return {};
+}
+
+export function loadMcpToolProfile(path: string = defaultConfigPath()): McpToolProfile {
+  return readConfig(path).mcpToolProfile === "full" ? "full" : "auto";
+}
+
+export function writeConfig(cfg: ReasonixConfig, path: string = defaultConfigPath()): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(cfg, null, 2), "utf8");
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    /* ignore on platforms without chmod */
+  }
+}
+
+export function loadDiagnosticsEnabled(
+  path: string = defaultConfigPath(),
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const override = env.SILICONCODE_DIAGNOSTICS?.trim().toLowerCase();
+  if (override === "0" || override === "false" || override === "off") return false;
+  if (override === "1" || override === "true" || override === "on") return true;
+  return readConfig(path).diagnostics?.enabled !== false;
+}
+
+export function loadDiagnosticsEndpoint(
+  path: string = defaultConfigPath(),
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const configured =
+    env.SILICONCODE_DIAGNOSTICS_ENDPOINT?.trim() ||
+    readConfig(path).diagnostics?.endpoint?.trim() ||
+    "https://code.ai6666.com/api/v1/client-diagnostics/events";
+  return configured.replace(/\/+$/, "");
+}
+
+export function saveDiagnosticsEnabled(enabled: boolean, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  cfg.diagnostics = { ...cfg.diagnostics, enabled };
+  writeConfig(cfg, path);
+}
+
+/** Resolve the language from config file. */
+export function loadLanguage(path: string = defaultConfigPath()): LanguageCode | undefined {
+  return readConfig(path).lang;
+}
+
+export function mcpEnvFor(
+  serverName: string | null | undefined,
+  cfg: ReasonixConfig,
+): Record<string, string> | undefined {
+  if (!serverName) return undefined;
+  const entry = cfg.mcpEnv?.[serverName];
+  if (!entry) return undefined;
+  // Coerce to string and drop empty values — JSON config could be sloppy.
+  const filtered: Record<string, string> = {};
+  for (const [k, v] of Object.entries(entry)) {
+    if (typeof v === "string" && v.length > 0) filtered[k] = v;
+  }
+  return Object.keys(filtered).length > 0 ? filtered : undefined;
+}
+
+function inferMcpTransport(cfg: McpServerConfig): "stdio" | "sse" | "streamable-http" {
+  if (cfg.transport) return cfg.transport;
+  const url = cfg.url?.trim() ?? "";
+  if (/^streamable\+https?:\/\//i.test(url)) return "streamable-http";
+  if (/^https?:\/\//i.test(url)) return "sse";
+  return "stdio";
+}
+
+function normalizeStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (typeof v === "string" && v.length > 0) out[k] = v;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+export function normalizeMcpConfig(cfg: ReasonixConfig, extraLegacy?: string[]): McpServerSpec[] {
+  const result: McpServerSpec[] = [];
+  const seen = new Set<string>();
+
+  // 1. Legacy specs first.
+  const disabledFromLegacy = new Set(cfg.mcpDisabled ?? []);
+  const legacySpecs = extraLegacy && extraLegacy.length > 0 ? extraLegacy : (cfg.mcp ?? []);
+  for (const raw of legacySpecs) {
+    if (typeof raw !== "string") continue;
+    try {
+      const spec = parseMcpSpec(raw);
+      const env = spec.name ? normalizeStringRecord(cfg.mcpEnv?.[spec.name]) : undefined;
+      const disabled = spec.name ? disabledFromLegacy.has(spec.name) : false;
+      if (spec.transport === "stdio") {
+        result.push({ ...spec, env, disabled });
+      } else if (spec.transport === "sse") {
+        result.push({ ...spec, disabled });
+      } else {
+        result.push({ ...spec, disabled });
+      }
+      if (spec.name) seen.add(spec.name);
+    } catch {
+      /* skip invalid legacy specs */
+    }
+  }
+
+  // 2. mcpServers objects override on name conflict.
+  for (const [name, serverCfg] of Object.entries(cfg.mcpServers ?? {})) {
+    if (!serverCfg || typeof serverCfg !== "object") continue;
+    const transport = inferMcpTransport(serverCfg as McpServerConfig);
+    const disabled = (serverCfg as McpServerConfig).disabled === true;
+    if (transport === "stdio") {
+      const env = normalizeStringRecord((serverCfg as McpServerConfig).env);
+      const spec: McpServerSpec = {
+        transport: "stdio",
+        name,
+        command: (serverCfg as McpServerConfig).command ?? "",
+        args: (serverCfg as McpServerConfig).args ?? [],
+        env,
+        disabled,
+      };
+      if (seen.has(name)) {
+        const idx = result.findIndex((s) => s.name === name);
+        if (idx >= 0) result[idx] = spec;
+      } else {
+        seen.add(name);
+        result.push(spec);
+      }
+    } else {
+      let url = (serverCfg as McpServerConfig).url ?? "";
+      const streamMatch = /^streamable\+(https?:\/\/.+)$/i.exec(url);
+      if (streamMatch) url = streamMatch[1]!;
+      const headers = normalizeStringRecord((serverCfg as McpServerConfig).headers);
+      if (transport === "sse") {
+        const spec: McpServerSpec = {
+          transport: "sse",
+          name,
+          url,
+          headers,
+          disabled,
+        };
+        if (seen.has(name)) {
+          const idx = result.findIndex((s) => s.name === name);
+          if (idx >= 0) result[idx] = spec;
+        } else {
+          seen.add(name);
+          result.push(spec);
+        }
+      } else {
+        const spec: McpServerSpec = {
+          transport: "streamable-http",
+          name,
+          url,
+          headers,
+          disabled,
+        };
+        if (seen.has(name)) {
+          const idx = result.findIndex((s) => s.name === name);
+          if (idx >= 0) result[idx] = spec;
+        } else {
+          seen.add(name);
+          result.push(spec);
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+/** Persist the language so it survives a relaunch. */
+export function saveLanguage(lang: LanguageCode, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  cfg.lang = lang;
+  writeConfig(cfg, path);
+}
+
+/** Resolve the API key from env var first, then the config file. */
+export function loadApiKey(path: string = defaultConfigPath()): string | undefined {
+  if (Array.isArray(readConfig(path).modelProviders)) {
+    return loadActiveModelProvider(path).apiKey;
+  }
+  if (process.env.DEEPSEEK_API_KEY) return process.env.DEEPSEEK_API_KEY;
+  return readConfig(path).apiKey;
+}
+
+/** env > config > undefined. Client falls back to api.deepseek.com when undefined. */
+export function loadBaseUrl(path: string = defaultConfigPath()): string | undefined {
+  if (Array.isArray(readConfig(path).modelProviders)) {
+    return loadActiveModelProvider(path).baseUrl;
+  }
+  if (process.env.DEEPSEEK_BASE_URL) return process.env.DEEPSEEK_BASE_URL;
+  return readConfig(path).baseUrl;
+}
+
+export function loadCustomProviderName(path: string = defaultConfigPath()): string | undefined {
+  const name = readConfig(path).customProviderName;
+  return typeof name === "string" && name.trim() ? name.trim() : undefined;
+}
+
+function isOfficialDeepSeekBaseUrl(value: string | undefined): boolean {
+  if (!value?.trim()) return true;
+  const normalized = value.trim().toLowerCase().replace(/\/+$/, "");
+  return normalized === "https://api.deepseek.com" || normalized === "https://api.deepseek.com/v1";
+}
+
+export const DEEPSEEK_PROVIDER_ID = "deepseek";
+
+function inferLegacyModelProviderKind(
+  cfg: ReasonixConfig,
+  env: NodeJS.ProcessEnv,
+): ModelProviderKind {
+  if (cfg.modelProvider === "deepseek" || cfg.modelProvider === "custom") {
+    return cfg.modelProvider;
+  }
+  if (typeof cfg.customProviderName === "string" && cfg.customProviderName.trim()) return "custom";
+  const baseUrl = env.DEEPSEEK_BASE_URL?.trim() || cfg.baseUrl;
+  if (!isOfficialDeepSeekBaseUrl(baseUrl)) return "custom";
+  const model = cfg.model?.trim();
+  if (
+    model &&
+    !new Set(["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]).has(
+      model,
+    )
+  ) {
+    return "custom";
+  }
+  return "deepseek";
+}
+
+function normalizeModelProvider(value: unknown): ModelProviderConfig | null {
+  if (!isPlainObject(value)) return null;
+  const kind = value.kind === "deepseek" || value.kind === "custom" ? value.kind : null;
+  if (!kind) return null;
+  const id = typeof value.id === "string" ? value.id.trim().slice(0, 80) : "";
+  if (!id) return null;
+  const nameValue = typeof value.name === "string" ? value.name.trim().slice(0, 80) : "";
+  const provider: ModelProviderConfig = {
+    id: kind === "deepseek" ? DEEPSEEK_PROVIDER_ID : id,
+    kind,
+    name: nameValue || (kind === "deepseek" ? "DeepSeek" : "OpenAI compatible"),
+  };
+  if (typeof value.apiKey === "string" && value.apiKey.trim())
+    provider.apiKey = value.apiKey.trim();
+  if (typeof value.baseUrl === "string" && value.baseUrl.trim()) {
+    provider.baseUrl = value.baseUrl.trim().replace(/\/+$/, "");
+  }
+  if (typeof value.model === "string" && value.model.trim()) provider.model = value.model.trim();
+  if (Array.isArray(value.models)) {
+    const models = [
+      ...new Set(
+        value.models
+          .filter((model): model is string => typeof model === "string")
+          .map((model) => model.trim())
+          .filter(Boolean),
+      ),
+    ].slice(0, 500);
+    if (models.length) provider.models = models;
+  }
+  if (kind === "deepseek" && !provider.models?.length) {
+    provider.models = ["deepseek-v4-flash", "deepseek-v4-pro"];
+  }
+  if (typeof value.preset === "string") provider.preset = value.preset as PresetName;
+  if (
+    value.reasoningEffortMax === "auto" ||
+    value.reasoningEffortMax === "none" ||
+    value.reasoningEffortMax === "high" ||
+    value.reasoningEffortMax === "xhigh" ||
+    value.reasoningEffortMax === "max"
+  ) {
+    provider.reasoningEffortMax = value.reasoningEffortMax;
+  }
+  if (
+    value.wireApi === "auto" ||
+    value.wireApi === "chat_completions" ||
+    value.wireApi === "responses"
+  ) {
+    provider.wireApi = value.wireApi;
+  }
+  return provider;
+}
+
+function modelProvidersFromConfig(
+  cfg: ReasonixConfig,
+  env: NodeJS.ProcessEnv,
+): ModelProviderConfig[] {
+  const persisted = Array.isArray(cfg.modelProviders)
+    ? cfg.modelProviders
+        .map(normalizeModelProvider)
+        .filter((item): item is ModelProviderConfig => !!item)
+    : [];
+  const unique = new Map<string, ModelProviderConfig>();
+  for (const provider of persisted) unique.set(provider.id, provider);
+
+  const legacyKind = inferLegacyModelProviderKind(cfg, env);
+  if (!unique.has(DEEPSEEK_PROVIDER_ID)) {
+    unique.set(DEEPSEEK_PROVIDER_ID, {
+      id: DEEPSEEK_PROVIDER_ID,
+      kind: "deepseek",
+      name: "DeepSeek",
+      apiKey: persisted.length === 0 && legacyKind === "deepseek" ? cfg.apiKey : undefined,
+      baseUrl: persisted.length === 0 && legacyKind === "deepseek" ? cfg.baseUrl : undefined,
+      model: persisted.length === 0 && legacyKind === "deepseek" ? cfg.model : undefined,
+      preset: cfg.preset,
+      reasoningEffortMax: "max",
+      wireApi: "chat_completions",
+    });
+  }
+
+  if (persisted.length === 0 && legacyKind === "custom") {
+    unique.set("custom-legacy", {
+      id: "custom-legacy",
+      kind: "custom",
+      name: cfg.customProviderName?.trim() || "OpenAI compatible",
+      apiKey: env.DEEPSEEK_API_KEY?.trim() || cfg.apiKey,
+      baseUrl: env.DEEPSEEK_BASE_URL?.trim() || cfg.baseUrl,
+      model: cfg.model,
+      reasoningEffortMax: "auto",
+      wireApi: "auto",
+    });
+  }
+  return [...unique.values()];
+}
+
+export function loadModelProviders(
+  path: string = defaultConfigPath(),
+  env: NodeJS.ProcessEnv = process.env,
+): ModelProviderConfig[] {
+  return modelProvidersFromConfig(readConfig(path), env);
+}
+
+function activeProviderIdFromConfig(
+  cfg: ReasonixConfig,
+  providers: readonly ModelProviderConfig[],
+  env: NodeJS.ProcessEnv,
+): string {
+  const explicit = cfg.activeModelProviderId?.trim();
+  if (explicit && providers.some((provider) => provider.id === explicit)) return explicit;
+  if (inferLegacyModelProviderKind(cfg, env) === "custom") {
+    return providers.find((provider) => provider.kind === "custom")?.id ?? DEEPSEEK_PROVIDER_ID;
+  }
+  return DEEPSEEK_PROVIDER_ID;
+}
+
+export function loadActiveModelProvider(
+  path: string = defaultConfigPath(),
+  env: NodeJS.ProcessEnv = process.env,
+): ActiveModelProvider {
+  const cfg = readConfig(path);
+  const providers = modelProvidersFromConfig(cfg, env);
+  const activeId = activeProviderIdFromConfig(cfg, providers, env);
+  const provider =
+    providers.find((item) => item.id === activeId) ??
+    providers.find((item) => item.id === DEEPSEEK_PROVIDER_ID)!;
+  const isDeepSeek = provider.kind === "deepseek";
+  return {
+    ...provider,
+    apiKey: isDeepSeek ? env.DEEPSEEK_API_KEY?.trim() || provider.apiKey : provider.apiKey,
+    baseUrl: isDeepSeek
+      ? env.DEEPSEEK_BASE_URL?.trim() || provider.baseUrl || "https://api.deepseek.com"
+      : provider.baseUrl || "",
+    reasoningEffortMax:
+      provider.reasoningEffortMax ?? (provider.kind === "deepseek" ? "max" : "auto"),
+    wireApi: provider.wireApi ?? (provider.kind === "deepseek" ? "chat_completions" : "auto"),
+  };
+}
+
+function syncLegacyProviderFields(
+  cfg: ReasonixConfig,
+  providers: readonly ModelProviderConfig[],
+  activeId: string,
+): void {
+  const active = providers.find((provider) => provider.id === activeId);
+  if (!active) throw new Error(`Unknown model provider: ${activeId}`);
+  cfg.modelProviders = [...providers];
+  cfg.activeModelProviderId = active.id;
+  cfg.apiKey = active.apiKey;
+  cfg.baseUrl = active.baseUrl;
+  cfg.model = active.model;
+  cfg.modelProvider = active.kind;
+  cfg.customProviderName = active.kind === "custom" ? active.name : undefined;
+  if (active.kind === "deepseek" && active.preset) cfg.preset = active.preset;
+}
+
+export function saveModelProvider(
+  input: Omit<ModelProviderConfig, "id"> & { id?: string },
+  path: string = defaultConfigPath(),
+): ModelProviderConfig {
+  const cfg = readConfig(path);
+  const providers = modelProvidersFromConfig(cfg, {});
+  const id =
+    input.kind === "deepseek"
+      ? DEEPSEEK_PROVIDER_ID
+      : input.id?.trim().slice(0, 80) || `custom-${randomUUID()}`;
+  const current = providers.find((provider) => provider.id === id);
+  const next = normalizeModelProvider({
+    ...current,
+    ...input,
+    id,
+    apiKey: input.apiKey?.trim() || current?.apiKey,
+  });
+  if (!next) throw new Error("Invalid model provider configuration.");
+  const updated = providers.filter((provider) => provider.id !== id);
+  updated.push(next);
+  syncLegacyProviderFields(cfg, updated, id);
+  writeConfig(cfg, path);
+  return next;
+}
+
+export function saveModelProviderModels(
+  id: string,
+  models: readonly string[],
+  path: string = defaultConfigPath(),
+): ModelProviderConfig {
+  const cfg = readConfig(path);
+  const providers = modelProvidersFromConfig(cfg, {});
+  const current = providers.find((provider) => provider.id === id);
+  if (!current) throw new Error(`Unknown model provider: ${id}`);
+  const updatedProvider = normalizeModelProvider({ ...current, models });
+  if (!updatedProvider) throw new Error("Invalid model provider catalog.");
+  const updated = providers.map((provider) =>
+    provider.id === updatedProvider.id ? updatedProvider : provider,
+  );
+  const activeId = activeProviderIdFromConfig(cfg, updated, {});
+  syncLegacyProviderFields(cfg, updated, activeId);
+  writeConfig(cfg, path);
+  return updatedProvider;
+}
+
+export function activateModelProvider(
+  id: string,
+  path: string = defaultConfigPath(),
+): ModelProviderConfig {
+  const cfg = readConfig(path);
+  const providers = modelProvidersFromConfig(cfg, {});
+  const provider = providers.find((item) => item.id === id);
+  if (!provider) throw new Error(`Unknown model provider: ${id}`);
+  syncLegacyProviderFields(cfg, providers, provider.id);
+  writeConfig(cfg, path);
+  return provider;
+}
+
+export function deleteModelProvider(id: string, path: string = defaultConfigPath()): void {
+  if (id === DEEPSEEK_PROVIDER_ID)
+    throw new Error("The built-in DeepSeek provider cannot be deleted.");
+  const cfg = readConfig(path);
+  const providers = modelProvidersFromConfig(cfg, {});
+  if (!providers.some((provider) => provider.id === id)) return;
+  const updated = providers.filter((provider) => provider.id !== id);
+  const activeId =
+    cfg.activeModelProviderId === id
+      ? DEEPSEEK_PROVIDER_ID
+      : activeProviderIdFromConfig(cfg, updated, {});
+  syncLegacyProviderFields(cfg, updated, activeId);
+  writeConfig(cfg, path);
+}
+
+export function saveActiveModelProviderApiKey(
+  apiKey: string,
+  path: string = defaultConfigPath(),
+): void {
+  const active = loadActiveModelProvider(path, {});
+  saveModelProvider({ ...active, apiKey }, path);
+}
+
+export function loadModelProviderKind(
+  path: string = defaultConfigPath(),
+  env: NodeJS.ProcessEnv = process.env,
+): ModelProviderKind {
+  return loadActiveModelProvider(path, env).kind;
+}
+
+function isNonNegativeNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+export function loadPricingOverride(
+  path: string = defaultConfigPath(),
+): Record<string, PricingOverride> {
+  const raw = readConfig(path).pricingOverride;
+  if (!isPlainObject(raw)) return {};
+
+  const result: Record<string, PricingOverride> = {};
+  for (const [model, value] of Object.entries(raw)) {
+    if (!isPlainObject(value)) continue;
+    const pricing: PricingOverride = {};
+    if (isNonNegativeNumber(value.inputCacheHit)) pricing.inputCacheHit = value.inputCacheHit;
+    if (isNonNegativeNumber(value.inputCacheMiss)) pricing.inputCacheMiss = value.inputCacheMiss;
+    if (isNonNegativeNumber(value.output)) pricing.output = value.output;
+    if (Object.keys(pricing).length > 0) result[model] = pricing;
+  }
+  return result;
+}
+
+export function loadRateLimit(path: string = defaultConfigPath()): RateLimitConfig | undefined {
+  const rpm = readConfig(path).rateLimit?.rpm;
+  if (typeof rpm !== "number" || !Number.isInteger(rpm) || rpm <= 0) return undefined;
+  return { rpm };
+}
+
+export function saveBaseUrl(url: string, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  const trimmed = url.trim();
+  if (trimmed) {
+    cfg.baseUrl = trimmed;
+  } else {
+    cfg.baseUrl = undefined;
+  }
+  writeConfig(cfg, path);
+}
+
+export function saveCustomProviderName(name: string, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  const trimmed = name.trim().slice(0, 80);
+  cfg.customProviderName = trimmed || undefined;
+  writeConfig(cfg, path);
+}
+
+export function saveModelProviderKind(
+  kind: ModelProviderKind,
+  path: string = defaultConfigPath(),
+): void {
+  const cfg = readConfig(path);
+  cfg.modelProvider = kind;
+  writeConfig(cfg, path);
+}
+
+export interface SkillPathEntry {
+  raw: string;
+  resolved: string;
+}
+
+export function resolveSkillPath(raw: string, baseDir: string): string {
+  const homeExpanded = expandCurrentUserHome(raw.trim());
+  return resolve(isAbsolute(homeExpanded) ? homeExpanded : join(baseDir, homeExpanded));
+}
+
+export function normalizeSkillPathEntries(
+  paths: readonly unknown[],
+  baseDir: string,
+): SkillPathEntry[] {
+  const out: SkillPathEntry[] = [];
+  const seen = new Set<string>();
+  for (const value of paths) {
+    if (typeof value !== "string") continue;
+    const raw = value.trim();
+    if (!raw) continue;
+    const resolved = resolveSkillPath(raw, baseDir);
+    const key = skillPathKey(resolved);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ raw, resolved });
+  }
+  return out;
+}
+
+export function normalizeSkillPaths(paths: readonly unknown[], baseDir: string): string[] {
+  return normalizeSkillPathEntries(paths, baseDir).map((entry) => entry.raw);
+}
+
+export function resolveSkillPaths(paths: readonly unknown[], baseDir: string): string[] {
+  return normalizeSkillPathEntries(paths, baseDir).map((entry) => entry.resolved);
+}
+
+function skillPathKey(path: string): string {
+  return process.platform === "win32" ? path.toLowerCase() : path;
+}
+
+function expandCurrentUserHome(path: string): string {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/") || path.startsWith("~\\")) return join(homedir(), path.slice(2));
+  return path;
+}
+
+export function loadSkillPaths(
+  baseDir: string = process.cwd(),
+  path: string = defaultConfigPath(),
+): string[] {
+  const raw = readConfig(path).skills?.paths;
+  return Array.isArray(raw) ? normalizeSkillPaths(raw, baseDir) : [];
+}
+
+export function loadResolvedSkillPaths(
+  baseDir: string = process.cwd(),
+  path: string = defaultConfigPath(),
+): string[] {
+  const raw = readConfig(path).skills?.paths;
+  return Array.isArray(raw) ? resolveSkillPaths(raw, baseDir) : [];
+}
+
+export function saveSkillPaths(
+  paths: readonly unknown[],
+  baseDir: string = process.cwd(),
+  path: string = defaultConfigPath(),
+): string[] {
+  const cfg = readConfig(path);
+  const normalized = normalizeSkillPaths(paths, baseDir);
+  cfg.skills = { ...(cfg.skills ?? {}), paths: normalized };
+  writeConfig(cfg, path);
+  return normalized;
+}
+
+export function addSkillPath(
+  skillPath: string,
+  baseDir: string = process.cwd(),
+  path: string = defaultConfigPath(),
+): { added: boolean; path: string; resolved: string; paths: string[] } | { error: string } {
+  const entry = normalizeSkillPathEntries([skillPath], baseDir)[0];
+  if (!entry) return { error: "skill path is empty" };
+  const existing = loadSkillPaths(baseDir, path);
+  const seen = new Set(resolveSkillPaths(existing, baseDir).map(skillPathKey));
+  const key = skillPathKey(entry.resolved);
+  if (seen.has(key))
+    return { added: false, path: entry.raw, resolved: entry.resolved, paths: existing };
+  const paths = saveSkillPaths([...existing, entry.raw], baseDir, path);
+  return { added: true, path: entry.raw, resolved: entry.resolved, paths };
+}
+
+export function removeSkillPath(
+  target: string,
+  baseDir: string = process.cwd(),
+  path: string = defaultConfigPath(),
+): { removed: boolean; path?: string; resolved?: string; paths: string[] } {
+  const existing = loadSkillPaths(baseDir, path);
+  const trimmed = target.trim();
+  if (!trimmed) return { removed: false, paths: existing };
+  const existingEntries = normalizeSkillPathEntries(existing, baseDir);
+  const idx = /^\d+$/.test(trimmed) ? Number.parseInt(trimmed, 10) - 1 : -1;
+  let removeAt = idx >= 0 && idx < existing.length ? idx : -1;
+  if (removeAt < 0) {
+    const targetEntry = normalizeSkillPathEntries([trimmed], baseDir)[0];
+    const targetKey = targetEntry ? skillPathKey(targetEntry.resolved) : undefined;
+    removeAt = existingEntries.findIndex(
+      (entry) =>
+        entry.raw === trimmed ||
+        (targetKey !== undefined && skillPathKey(entry.resolved) === targetKey),
+    );
+  }
+  if (removeAt < 0) return { removed: false, paths: existing };
+  const removed = existingEntries[removeAt];
+  const paths = saveSkillPaths(
+    existing.filter((_, i) => i !== removeAt),
+    baseDir,
+    path,
+  );
+  return {
+    removed: true,
+    path: removed?.raw ?? existing[removeAt],
+    resolved: removed?.resolved,
+    paths,
+  };
+}
+
+export function searchEnabled(path: string = defaultConfigPath()): boolean {
+  const env = (process.env.SILICONCODE_SEARCH ?? process.env.REASONIX_SEARCH)?.trim().toLowerCase();
+  if (env === "off" || env === "false" || env === "0") return false;
+  const cfg = readConfig(path).search;
+  if (cfg === false) return false;
+  return true;
+}
+
+export function webSearchEngine(
+  path: string = defaultConfigPath(),
+): "mojeek" | "searxng" | "metaso" {
+  const env = (process.env.SILICONCODE_WEB_SEARCH_ENGINE ?? process.env.REASONIX_WEB_SEARCH_ENGINE)
+    ?.trim()
+    .toLowerCase();
+  if (env === "searxng") return "searxng";
+  if (env === "metaso") return "metaso";
+  if (env === "mojeek") return "mojeek";
+  const cfg = readConfig(path).webSearchEngine;
+  if (cfg === "searxng") return "searxng";
+  if (cfg === "mojeek") return "mojeek";
+  return "metaso";
+}
+
+export function webSearchEndpoint(path: string = defaultConfigPath()): string {
+  const env = (
+    process.env.SILICONCODE_WEB_SEARCH_ENDPOINT ?? process.env.REASONIX_WEB_SEARCH_ENDPOINT
+  )?.trim();
+  if (env) return env;
+  const cfg = readConfig(path).webSearchEndpoint;
+  if (cfg && typeof cfg === "string") return cfg;
+  return "http://localhost:8080";
+}
+
+export function saveApiKey(key: string, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  cfg.apiKey = key.trim();
+  writeConfig(cfg, path);
+}
+
+/** Windows: case-insensitive — NTFS treats `F:\Foo` and `f:\foo` as one directory (#402). */
+function findProjectKey(cfg: ReasonixConfig, rootDir: string): string | undefined {
+  const projects = cfg.projects;
+  if (!projects) return undefined;
+  if (Object.hasOwn(projects, rootDir)) return rootDir;
+  if (process.platform !== "win32") return undefined;
+  const lower = rootDir.toLowerCase();
+  for (const k of Object.keys(projects)) {
+    if (k.toLowerCase() === lower) return k;
+  }
+  return undefined;
+}
+
+export function loadProjectShellAllowed(
+  rootDir: string,
+  path: string = defaultConfigPath(),
+): string[] {
+  const cfg = readConfig(path);
+  const key = findProjectKey(cfg, rootDir);
+  if (key === undefined) return [];
+  return cfg.projects?.[key]?.shellAllowed ?? [];
+}
+
+export function addProjectShellAllowed(
+  rootDir: string,
+  prefix: string,
+  path: string = defaultConfigPath(),
+): void {
+  const trimmed = prefix.trim();
+  if (!trimmed) return;
+  const cfg = readConfig(path);
+  if (!cfg.projects) cfg.projects = {};
+  const key = findProjectKey(cfg, rootDir) ?? rootDir;
+  if (!cfg.projects[key]) cfg.projects[key] = {};
+  const existing = cfg.projects[key].shellAllowed ?? [];
+  if (existing.includes(trimmed)) return;
+  cfg.projects[key].shellAllowed = [...existing, trimmed];
+  writeConfig(cfg, path);
+}
+
+/** Match is exact after trim — NOT prefix-match: removing `git` MUST NOT drop `git push origin main`. */
+export function removeProjectShellAllowed(
+  rootDir: string,
+  prefix: string,
+  path: string = defaultConfigPath(),
+): boolean {
+  const trimmed = prefix.trim();
+  if (!trimmed) return false;
+  const cfg = readConfig(path);
+  const key = findProjectKey(cfg, rootDir);
+  if (key === undefined) return false;
+  const existing = cfg.projects?.[key]?.shellAllowed ?? [];
+  if (!existing.includes(trimmed)) return false;
+  const next = existing.filter((p) => p !== trimmed);
+  if (!cfg.projects) cfg.projects = {};
+  if (!cfg.projects[key]) cfg.projects[key] = {};
+  cfg.projects[key].shellAllowed = next;
+  writeConfig(cfg, path);
+  return true;
+}
+
+export function clearProjectShellAllowed(
+  rootDir: string,
+  path: string = defaultConfigPath(),
+): number {
+  const cfg = readConfig(path);
+  const key = findProjectKey(cfg, rootDir);
+  if (key === undefined) return 0;
+  const existing = cfg.projects?.[key]?.shellAllowed ?? [];
+  if (existing.length === 0) return 0;
+  if (!cfg.projects) cfg.projects = {};
+  if (!cfg.projects[key]) cfg.projects[key] = {};
+  cfg.projects[key].shellAllowed = [];
+  writeConfig(cfg, path);
+  return existing.length;
+}
+
+export function loadProjectPathAllowed(
+  rootDir: string,
+  path: string = defaultConfigPath(),
+): string[] {
+  const cfg = readConfig(path);
+  const key = findProjectKey(cfg, rootDir);
+  if (key === undefined) return [];
+  return cfg.projects?.[key]?.pathAllowed ?? [];
+}
+
+export function addProjectPathAllowed(
+  rootDir: string,
+  prefix: string,
+  path: string = defaultConfigPath(),
+): void {
+  const trimmed = prefix.trim();
+  if (!trimmed) return;
+  const cfg = readConfig(path);
+  if (!cfg.projects) cfg.projects = {};
+  const key = findProjectKey(cfg, rootDir) ?? rootDir;
+  if (!cfg.projects[key]) cfg.projects[key] = {};
+  const existing = cfg.projects[key].pathAllowed ?? [];
+  if (existing.includes(trimmed)) return;
+  cfg.projects[key].pathAllowed = [...existing, trimmed];
+  writeConfig(cfg, path);
+}
+
+export function removeProjectPathAllowed(
+  rootDir: string,
+  prefix: string,
+  path: string = defaultConfigPath(),
+): boolean {
+  const trimmed = prefix.trim();
+  if (!trimmed) return false;
+  const cfg = readConfig(path);
+  const key = findProjectKey(cfg, rootDir);
+  if (key === undefined) return false;
+  const existing = cfg.projects?.[key]?.pathAllowed ?? [];
+  if (!existing.includes(trimmed)) return false;
+  const next = existing.filter((p) => p !== trimmed);
+  if (!cfg.projects) cfg.projects = {};
+  if (!cfg.projects[key]) cfg.projects[key] = {};
+  cfg.projects[key].pathAllowed = next;
+  writeConfig(cfg, path);
+  return true;
+}
+
+export function clearProjectPathAllowed(
+  rootDir: string,
+  path: string = defaultConfigPath(),
+): number {
+  const cfg = readConfig(path);
+  const key = findProjectKey(cfg, rootDir);
+  if (key === undefined) return 0;
+  const existing = cfg.projects?.[key]?.pathAllowed ?? [];
+  if (existing.length === 0) return 0;
+  if (!cfg.projects) cfg.projects = {};
+  if (!cfg.projects[key]) cfg.projects[key] = {};
+  cfg.projects[key].pathAllowed = [];
+  writeConfig(cfg, path);
+  return existing.length;
+}
+
+/** Unknown values fall back to "review" so hand-edited bad config gets the safe default. */
+export function loadEditMode(path: string = defaultConfigPath()): EditMode {
+  const v = readConfig(path).editMode;
+  if (v === "auto" || v === "yolo") return v;
+  return "review";
+}
+
+/** Persist the edit mode so `/mode auto` survives a relaunch. */
+export function saveEditMode(mode: EditMode, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  cfg.editMode = mode;
+  writeConfig(cfg, path);
+}
+
+/** True when the onboarding tip for the review/AUTO gate has been shown. */
+export function editModeHintShown(path: string = defaultConfigPath()): boolean {
+  return readConfig(path).editModeHintShown === true;
+}
+
+/** True when the mouse-tracking + clipboard tip has been shown. */
+export function mouseClipboardHintShown(path: string = defaultConfigPath()): boolean {
+  return readConfig(path).mouseClipboardHintShown === true;
+}
+
+/** Unknown / missing fall back to "max" so hand-edited bad config can't silently override the default. */
+export function loadReasoningEffort(path: string = defaultConfigPath()): ReasoningEffort {
+  const v = readConfig(path).reasoningEffort;
+  return v === "high" ? "high" : "max";
+}
+
+export function loadThinkingMode(path: string = defaultConfigPath()): ThinkingPreference {
+  const cfg = readConfig(path);
+  const value = cfg.thinkingMode;
+  if (value === "enabled" || value === "disabled" || value === "auto") return value;
+  const rawModel = typeof cfg.model === "string" ? cfg.model.trim() : "";
+  return migrateRetiredModel(rawModel).thinking ?? "auto";
+}
+
+export function saveThinkingMode(
+  mode: ThinkingPreference,
+  path: string = defaultConfigPath(),
+): void {
+  const cfg = readConfig(path);
+  cfg.thinkingMode = mode;
+  writeConfig(cfg, path);
+}
+
+export function loadMaxOutputTokens(path: string = defaultConfigPath()): number | undefined {
+  const value = readConfig(path).maxOutputTokens;
+  return Number.isInteger(value) && (value ?? 0) > 0 ? value : undefined;
+}
+
+export function saveMaxOutputTokens(
+  tokens: number | undefined,
+  path: string = defaultConfigPath(),
+): void {
+  const cfg = readConfig(path);
+  cfg.maxOutputTokens = Number.isInteger(tokens) && (tokens ?? 0) > 0 ? tokens : undefined;
+  writeConfig(cfg, path);
+}
+
+export function loadProviderUserId(path: string = defaultConfigPath()): string | undefined {
+  const value = readConfig(path).userId;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+export function loadContextWindowOverride(
+  path: string = defaultConfigPath(),
+): Record<string, number> {
+  const raw = readConfig(path).contextWindowOverride;
+  if (!raw || typeof raw !== "object") return {};
+  return Object.fromEntries(
+    Object.entries(raw).filter(
+      ([model, value]) => model.trim().length > 0 && Number.isInteger(value) && value > 0,
+    ),
+  );
+}
+
+export type OutputStyle = "default" | "explanatory" | "learning";
+export const OUTPUT_STYLES: readonly OutputStyle[] = ["default", "explanatory", "learning"];
+
+export function isOutputStyle(value: string): value is OutputStyle {
+  return (OUTPUT_STYLES as readonly string[]).includes(value);
+}
+
+export function loadOutputStyle(path: string = defaultConfigPath()): OutputStyle {
+  const value = readConfig(path).outputStyle;
+  return typeof value === "string" && isOutputStyle(value) ? value : "default";
+}
+
+export function saveOutputStyle(style: OutputStyle, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  cfg.outputStyle = style;
+  writeConfig(cfg, path);
+}
+
+export type StatusBarPreset = "minimal" | "default" | "full";
+const STATUS_BAR_FULL: NonNullable<ReasonixConfig["statusBar"]> = {
+  showMode: true,
+  showPreset: true,
+  showSessionInfo: true,
+  showBalance: true,
+  showSessionCost: true,
+  showTurnCost: true,
+  showCacheHit: true,
+  showCtxUsage: true,
+  showVersion: true,
+  showFeedbackHint: true,
+};
+const STATUS_BAR_MINIMAL: NonNullable<ReasonixConfig["statusBar"]> = {
+  showMode: false,
+  showPreset: false,
+  showSessionInfo: false,
+  showBalance: false,
+  showSessionCost: false,
+  showTurnCost: false,
+  showCacheHit: false,
+  showCtxUsage: true,
+  showVersion: true,
+  showFeedbackHint: false,
+};
+
+export function saveStatusBarPreset(
+  preset: StatusBarPreset,
+  path: string = defaultConfigPath(),
+): void {
+  const cfg = readConfig(path);
+  if (preset === "default") {
+    cfg.statusBar = undefined;
+  } else {
+    cfg.statusBar = preset === "full" ? STATUS_BAR_FULL : STATUS_BAR_MINIMAL;
+  }
+  writeConfig(cfg, path);
+}
+
+export function loadVimMode(path: string = defaultConfigPath()): boolean {
+  return readConfig(path).vimMode === true;
+}
+
+export function saveVimMode(enabled: boolean, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  cfg.vimMode = enabled;
+  writeConfig(cfg, path);
+}
+
+export function loadTheme(path: string = defaultConfigPath()): ThemeName | "auto" | undefined {
+  const value = readConfig(path).theme;
+  if (value === "auto") return "auto";
+  if (typeof value === "string" && isThemeName(value)) return value;
+  return undefined;
+}
+
+export function loadThemeEnv(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return env.SILICONCODE_THEME ?? env.REASONIX_THEME;
+}
+
+export function resolveThemePreference(
+  configTheme: ThemeName | "auto" | undefined,
+  envTheme?: string | null,
+): ThemeName {
+  if (configTheme && configTheme !== "auto") return configTheme;
+  return resolveThemeName(envTheme);
+}
+
+export function saveTheme(theme: ThemeName | "auto", path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  cfg.theme = theme;
+  writeConfig(cfg, path);
+}
+
+/** Persist the reasoning_effort cap so `/effort high` survives a relaunch. */
+export function saveReasoningEffort(
+  effort: ReasoningEffort,
+  path: string = defaultConfigPath(),
+): void {
+  const cfg = readConfig(path);
+  cfg.reasoningEffort = effort;
+  writeConfig(cfg, path);
+}
+
+export function loadWorkspaceDir(path: string = defaultConfigPath()): string | undefined {
+  const v = readConfig(path).workspaceDir;
+  return typeof v === "string" && v.trim() ? v : undefined;
+}
+
+export function saveWorkspaceDir(dir: string, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  const trimmed = dir.trim();
+  if (trimmed) cfg.workspaceDir = trimmed;
+  else cfg.workspaceDir = undefined;
+  writeConfig(cfg, path);
+}
+
+export function loadEditor(path: string = defaultConfigPath()): string | undefined {
+  const v = readConfig(path).editor;
+  return typeof v === "string" && v.trim() ? v : undefined;
+}
+
+export function saveEditor(editor: string, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  const trimmed = editor.trim();
+  if (trimmed) cfg.editor = trimmed;
+  else cfg.editor = undefined;
+  writeConfig(cfg, path);
+}
+
+export function loadRecentWorkspaces(path: string = defaultConfigPath()): string[] {
+  const v = readConfig(path).recentWorkspaces;
+  return Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : [];
+}
+
+const MAX_RECENT_WORKSPACES = 8;
+export function pushRecentWorkspace(dir: string, path: string = defaultConfigPath()): void {
+  const trimmed = dir.trim();
+  if (!trimmed) return;
+  const cfg = readConfig(path);
+  const list = (cfg.recentWorkspaces ?? []).filter((s) => s !== trimmed);
+  list.unshift(trimmed);
+  cfg.recentWorkspaces = list.slice(0, MAX_RECENT_WORKSPACES);
+  writeConfig(cfg, path);
+}
+
+export function loadDesktopOpenTabs(path: string = defaultConfigPath()): string[] {
+  const v = readConfig(path).desktopOpenTabs;
+  return Array.isArray(v)
+    ? v.filter((s): s is string => typeof s === "string" && s.length > 0)
+    : [];
+}
+
+export function saveDesktopOpenTabs(dirs: string[], path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  const cleaned = dirs.filter((s): s is string => typeof s === "string" && s.length > 0);
+  if (cleaned.length === 0) {
+    cfg.desktopOpenTabs = undefined;
+  } else {
+    cfg.desktopOpenTabs = cleaned;
+  }
+  writeConfig(cfg, path);
+}
+
+export function loadPreset(path: string = defaultConfigPath()): PresetName | undefined {
+  return readConfig(path).preset;
+}
+
+export function loadModel(path: string = defaultConfigPath()): string | undefined {
+  const model = readConfig(path).model;
+  if (typeof model !== "string" || !model.trim()) return undefined;
+  return migrateRetiredModel(model.trim()).model;
+}
+
+/** Persist an explicit model pin while keeping the preset as the effort fallback. */
+export function saveModel(model: string, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  const trimmed = model.trim();
+  const migrated = migrateRetiredModel(trimmed);
+  cfg.model = migrated.model || undefined;
+  if (migrated.thinking) cfg.thinkingMode = migrated.thinking;
+  writeConfig(cfg, path);
+}
+
+/** Persist a preset and clear any explicit model pin so the preset owns model selection. */
+export function savePreset(preset: PresetName, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  cfg.preset = preset;
+  cfg.model = undefined;
+  writeConfig(cfg, path);
+}
+
+export function loadIndexUserConfig(path: string = defaultConfigPath()): IndexUserConfig {
+  return readConfig(path).index ?? {};
+}
+
+export function loadIndexConfig(path: string = defaultConfigPath()): ResolvedIndexConfig {
+  return resolveIndexConfig(readConfig(path).index);
+}
+
+export function saveIndexConfig(user: IndexUserConfig, path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  cfg.index = user;
+  writeConfig(cfg, path);
+}
+
+export function loadSemanticEmbeddingUserConfig(
+  path: string = defaultConfigPath(),
+): SemanticEmbeddingUserConfig {
+  return normalizeSemanticEmbeddingUserConfig(readConfig(path).semantic);
+}
+
+export function saveSemanticEmbeddingConfig(
+  user: SemanticEmbeddingUserConfig,
+  path: string = defaultConfigPath(),
+): void {
+  const cfg = readConfig(path);
+  cfg.semantic = normalizeSemanticEmbeddingUserConfig(user);
+  writeConfig(cfg, path);
+}
+
+export function resolveSemanticEmbeddingConfig(
+  path: string = defaultConfigPath(),
+): ResolvedEmbeddingConfig {
+  const user = loadSemanticEmbeddingUserConfig(path);
+  const provider = user.provider ?? "ollama";
+  if (provider === "openai-compat") {
+    const baseUrl = user.openaiCompat?.baseUrl?.trim() ?? "";
+    const apiKey = user.openaiCompat?.apiKey?.trim() ?? "";
+    const model = user.openaiCompat?.model?.trim() ?? "";
+    if (!baseUrl) throw new Error("OpenAI-compatible embeddings require an API URL.");
+    requireValidUrl(baseUrl, "OpenAI-compatible API URL");
+    if (!apiKey) throw new Error("OpenAI-compatible embeddings require an API key.");
+    if (!model) throw new Error("OpenAI-compatible embeddings require a model.");
+    return {
+      provider,
+      baseUrl,
+      apiKey,
+      model,
+      extraBody: normalizeExtraBody(user.openaiCompat?.extraBody),
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+      batchSize: user.openaiCompat?.batchSize ?? DEFAULT_BATCH_SIZE,
+    };
+  }
+  return {
+    provider: "ollama",
+    baseUrl: user.ollama?.baseUrl?.trim() || process.env.OLLAMA_URL || DEFAULT_OLLAMA_URL,
+    model: user.ollama?.model?.trim() || resolveSemanticOllamaModelEnv() || DEFAULT_EMBED_MODEL,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  };
+}
+
+export function redactSemanticEmbeddingConfig(
+  user: SemanticEmbeddingUserConfig,
+): SemanticEmbeddingConfigView {
+  const normalized = normalizeSemanticEmbeddingUserConfig(user);
+  return {
+    provider: normalized.provider ?? "ollama",
+    ollama: {
+      baseUrl: normalized.ollama?.baseUrl?.trim() || process.env.OLLAMA_URL || DEFAULT_OLLAMA_URL,
+      model:
+        normalized.ollama?.model?.trim() || resolveSemanticOllamaModelEnv() || DEFAULT_EMBED_MODEL,
+    },
+    openaiCompat: {
+      baseUrl: normalized.openaiCompat?.baseUrl?.trim() ?? "",
+      apiKey: normalized.openaiCompat?.apiKey ? redactKey(normalized.openaiCompat.apiKey) : "",
+      apiKeySet: Boolean(normalized.openaiCompat?.apiKey?.trim()),
+      model: normalized.openaiCompat?.model?.trim() ?? "",
+      extraBody: normalizeExtraBody(normalized.openaiCompat?.extraBody),
+      batchSize: normalized.openaiCompat?.batchSize ?? DEFAULT_BATCH_SIZE,
+    },
+  };
+}
+
+/** Mark the onboarding tip as shown so subsequent launches skip it. */
+export function markEditModeHintShown(path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  if (cfg.editModeHintShown === true) return;
+  cfg.editModeHintShown = true;
+  writeConfig(cfg, path);
+}
+
+/** Mark the mouse + clipboard tip as shown. */
+export function markMouseClipboardHintShown(path: string = defaultConfigPath()): void {
+  const cfg = readConfig(path);
+  if (cfg.mouseClipboardHintShown === true) return;
+  cfg.mouseClipboardHintShown = true;
+  writeConfig(cfg, path);
+}
+
+/** Self-hosted DeepSeek-compatible endpoints may issue any token shape, so we only typo-guard here — the real auth check is the first API call against `baseUrl`. */
+export function isPlausibleKey(key: string): boolean {
+  const trimmed = key.trim();
+  if (trimmed.length < 16) return false;
+  return !/\s/.test(trimmed);
+}
+
+/** Mask a key for display: `sk-abcd...wxyz`. */
+export function redactKey(key: string): string {
+  if (!key) return "";
+  if (key.length <= 12) return "****";
+  return `${key.slice(0, 6)}…${key.slice(-4)}`;
+}
+
+function normalizeSemanticEmbeddingUserConfig(
+  cfg: SemanticEmbeddingUserConfig | undefined,
+): SemanticEmbeddingUserConfig {
+  return {
+    provider: cfg?.provider === "openai-compat" ? "openai-compat" : "ollama",
+    ollama: {
+      baseUrl: normalizeOptionalString(cfg?.ollama?.baseUrl),
+      model: normalizeOptionalString(cfg?.ollama?.model),
+    },
+    openaiCompat: {
+      baseUrl: normalizeOptionalString(cfg?.openaiCompat?.baseUrl),
+      apiKey: normalizeOptionalString(cfg?.openaiCompat?.apiKey),
+      model: normalizeOptionalString(cfg?.openaiCompat?.model),
+      extraBody: normalizeExtraBody(cfg?.openaiCompat?.extraBody),
+      batchSize: normalizePositiveInt(cfg?.openaiCompat?.batchSize),
+    },
+  };
+}
+
+function normalizeOptionalString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function normalizePositiveInt(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function normalizeExtraBody(value: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (value === undefined) return {};
+  if (!isPlainObject(value)) {
+    throw new Error("Semantic embedding extraBody must be a JSON object.");
+  }
+  return { ...value };
+}
+
+function requireValidUrl(value: string, label: string): void {
+  try {
+    new URL(value);
+  } catch {
+    throw new Error(`${label} must be a valid URL.`);
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+export interface LoadedQQConfig {
+  appId?: string;
+  appSecret?: string;
+  sandbox?: boolean;
+  enabled?: boolean;
+  ownerOpenId?: string;
+  allowlist?: string[];
+}
+
+export function loadQQConfig(path: string = defaultConfigPath()): LoadedQQConfig {
+  const envSandbox = process.env.QQ_SANDBOX;
+  const envAllowlist = normalizeQQAllowlist(process.env.QQ_ALLOWLIST);
+  const fromEnv = {
+    appId: process.env.QQ_APPID,
+    appSecret: process.env.QQ_SECRET,
+    sandbox: envSandbox === "1" ? true : envSandbox === "0" ? false : undefined,
+    ownerOpenId: normalizeQQOpenId(process.env.QQ_OWNER_OPENID),
+    allowlist: envAllowlist,
+  };
+  const fromCfg = readConfig(path).qq ?? {};
+  const ownerOpenId = fromEnv.ownerOpenId ?? normalizeQQOpenId(fromCfg.ownerOpenId);
+  const allowlist = normalizeQQAllowlist(fromEnv.allowlist ?? fromCfg.allowlist)?.filter(
+    (openid) => openid !== ownerOpenId,
+  );
+  return {
+    appId: fromEnv.appId ?? fromCfg.appId,
+    appSecret: fromEnv.appSecret ?? fromCfg.appSecret,
+    sandbox: fromEnv.sandbox ?? fromCfg.sandbox ?? false,
+    enabled: fromCfg.enabled === true,
+    ownerOpenId,
+    allowlist,
+  };
+}
+
+export function saveQQConfig(cfg: LoadedQQConfig, path: string = defaultConfigPath()): void {
+  const rootCfg = readConfig(path);
+  const ownerOpenId = normalizeQQOpenId(cfg.ownerOpenId);
+  const allowlist = normalizeQQAllowlist(cfg.allowlist)?.filter((openid) => openid !== ownerOpenId);
+  rootCfg.qq = {
+    appId: cfg.appId,
+    appSecret: cfg.appSecret,
+    sandbox: cfg.sandbox,
+    enabled: cfg.enabled,
+    ownerOpenId,
+    allowlist,
+  };
+  writeConfig(rootCfg, path);
+}

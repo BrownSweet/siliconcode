@@ -1,0 +1,232 @@
+import type { Usage } from "../client.js";
+import { loadContextWindowOverride, loadPricingOverride } from "../config.js";
+import { DEFAULT_CONTEXT_TOKENS, MODEL_CAPABILITIES, type ModelPricing } from "../models.js";
+
+/** USD per 1M tokens; display currency conversion happens at the UI boundary. */
+export const DEEPSEEK_PRICING: Record<string, ModelPricing> = Object.fromEntries(
+  Object.values(MODEL_CAPABILITIES).map((model) => [model.id, model.pricing]),
+);
+
+export type { ModelPricing };
+
+export function pricingFor(model: string, path?: string): ModelPricing | undefined {
+  const defaults = DEEPSEEK_PRICING[model];
+  const override = loadPricingOverride(path)[model];
+  if (!override) return defaults;
+  const pricing = { ...defaults, ...override };
+  if (
+    pricing.inputCacheHit === undefined ||
+    pricing.inputCacheMiss === undefined ||
+    pricing.output === undefined
+  ) {
+    return undefined;
+  }
+  return pricing as ModelPricing;
+}
+
+/** Reference Claude Sonnet 4.6 pricing (USD per 1M tokens). */
+export const CLAUDE_SONNET_PRICING = { input: 3.0, output: 15.0 };
+
+/** Prompt-side window only; completion caps live server-side and don't affect this gauge. */
+export const DEEPSEEK_CONTEXT_TOKENS: Record<string, number> = {
+  ...Object.fromEntries(
+    Object.values(MODEL_CAPABILITIES).map((model) => [model.id, model.contextTokens]),
+  ),
+};
+
+/** Silent conservative fallback for models absent from local optional metadata. */
+export { DEFAULT_CONTEXT_TOKENS };
+
+export function contextTokensFor(model: string, path?: string): number {
+  return (
+    loadContextWindowOverride(path)[model] ??
+    DEEPSEEK_CONTEXT_TOKENS[model] ??
+    DEFAULT_CONTEXT_TOKENS
+  );
+}
+
+export function hasKnownContextWindow(model: string, path?: string): boolean {
+  return (
+    loadContextWindowOverride(path)[model] !== undefined ||
+    DEEPSEEK_CONTEXT_TOKENS[model] !== undefined
+  );
+}
+
+export function costUsd(model: string, usage: Usage, path?: string): number {
+  const p = pricingFor(model, path);
+  if (!p) return 0;
+  return (
+    (usage.promptCacheHitTokens * p.inputCacheHit +
+      usage.promptCacheMissTokens * p.inputCacheMiss +
+      usage.completionTokens * p.output) /
+    1_000_000
+  );
+}
+
+/** Input-side cost only (prompt, cache hit + miss). Used for the panel breakdown. */
+export function inputCostUsd(model: string, usage: Usage, path?: string): number {
+  const p = pricingFor(model, path);
+  if (!p) return 0;
+  return (
+    (usage.promptCacheHitTokens * p.inputCacheHit +
+      usage.promptCacheMissTokens * p.inputCacheMiss) /
+    1_000_000
+  );
+}
+
+/** Output-side cost only (completion tokens). Used for the panel breakdown. */
+export function outputCostUsd(model: string, usage: Usage, path?: string): number {
+  const p = pricingFor(model, path);
+  if (!p) return 0;
+  return (usage.completionTokens * p.output) / 1_000_000;
+}
+
+export function cacheSavingsUsd(model: string, hitTokens: number, path?: string): number {
+  if (hitTokens <= 0) return 0;
+  const p = pricingFor(model, path);
+  if (!p) return 0;
+  return (hitTokens * (p.inputCacheMiss - p.inputCacheHit)) / 1_000_000;
+}
+
+export function claudeEquivalentCost(usage: Usage): number {
+  return (
+    (usage.promptTokens * CLAUDE_SONNET_PRICING.input +
+      usage.completionTokens * CLAUDE_SONNET_PRICING.output) /
+    1_000_000
+  );
+}
+
+export interface TurnStats {
+  turn: number;
+  model: string;
+  usage: Usage;
+  cost: number;
+  cacheHitRatio: number;
+}
+
+export interface SessionSummary {
+  turns: number;
+  totalCostUsd: number;
+  totalInputCostUsd: number;
+  /** Output-side (completion) cost aggregated across the session. */
+  totalOutputCostUsd: number;
+  /** @deprecated Claude reference; kept for benchmarks + replay compat, no longer surfaced in the TUI. */
+  claudeEquivalentUsd: number;
+  /** @deprecated. Same as claudeEquivalentUsd — synthetic ratio, not a real measurement. */
+  savingsVsClaudePct: number;
+  cacheHitRatio: number;
+  /** Floor estimate for next call — actual cost = this + user delta + new tool outputs. */
+  lastPromptTokens: number;
+  lastTurnCostUsd: number;
+}
+
+export class SessionStats {
+  readonly turns: TurnStats[] = [];
+  /** Cost from prior runs of a resumed session, restored from session meta. */
+  private _carryoverCost = 0;
+  /** Turn count from prior runs of a resumed session. */
+  private _carryoverTurns = 0;
+  private _carryoverCacheHit = 0;
+  private _carryoverCacheMiss = 0;
+  /** Last turn's promptTokens before exit — surfaced via summary() until the next live turn lands. */
+  private _carryoverLastPromptTokens = 0;
+
+  /** Seed totals from a resumed session's persisted meta — only call once at construction. */
+  seedCarryover(opts: {
+    totalCostUsd?: number;
+    turnCount?: number;
+    cacheHitTokens?: number;
+    cacheMissTokens?: number;
+    lastPromptTokens?: number;
+  }): void {
+    if (typeof opts.totalCostUsd === "number" && opts.totalCostUsd > 0) {
+      this._carryoverCost = opts.totalCostUsd;
+    }
+    if (typeof opts.turnCount === "number" && opts.turnCount > 0) {
+      this._carryoverTurns = opts.turnCount;
+    }
+    if (typeof opts.cacheHitTokens === "number" && opts.cacheHitTokens > 0) {
+      this._carryoverCacheHit = opts.cacheHitTokens;
+    }
+    if (typeof opts.cacheMissTokens === "number" && opts.cacheMissTokens > 0) {
+      this._carryoverCacheMiss = opts.cacheMissTokens;
+    }
+    if (typeof opts.lastPromptTokens === "number" && opts.lastPromptTokens > 0) {
+      this._carryoverLastPromptTokens = opts.lastPromptTokens;
+    }
+  }
+
+  reset(): void {
+    this.turns.length = 0;
+    this._carryoverCost = 0;
+    this._carryoverTurns = 0;
+    this._carryoverCacheHit = 0;
+    this._carryoverCacheMiss = 0;
+    this._carryoverLastPromptTokens = 0;
+  }
+
+  record(turn: number, model: string, usage: Usage): TurnStats {
+    const cost = costUsd(model, usage);
+    const stats: TurnStats = {
+      turn,
+      model,
+      usage,
+      cost,
+      cacheHitRatio: usage.cacheHitRatio,
+    };
+    this.turns.push(stats);
+    return stats;
+  }
+
+  get totalCost(): number {
+    return this._carryoverCost + this.turns.reduce((sum, t) => sum + t.cost, 0);
+  }
+
+  get totalClaudeEquivalent(): number {
+    return this.turns.reduce((sum, t) => sum + claudeEquivalentCost(t.usage), 0);
+  }
+
+  get savingsVsClaude(): number {
+    const c = this.totalClaudeEquivalent;
+    return c > 0 ? 1 - this.totalCost / c : 0;
+  }
+
+  get totalInputCost(): number {
+    return this.turns.reduce((sum, t) => sum + inputCostUsd(t.model, t.usage), 0);
+  }
+
+  get totalOutputCost(): number {
+    return this.turns.reduce((sum, t) => sum + outputCostUsd(t.model, t.usage), 0);
+  }
+
+  get aggregateCacheHitRatio(): number {
+    let hit = this._carryoverCacheHit;
+    let miss = this._carryoverCacheMiss;
+    for (const t of this.turns) {
+      hit += t.usage.promptCacheHitTokens;
+      miss += t.usage.promptCacheMissTokens;
+    }
+    const denom = hit + miss;
+    return denom > 0 ? hit / denom : 0;
+  }
+
+  summary(): SessionSummary {
+    const last = this.turns[this.turns.length - 1];
+    return {
+      turns: this.turns.length + this._carryoverTurns,
+      totalCostUsd: round(this.totalCost, 6),
+      totalInputCostUsd: round(this.totalInputCost, 6),
+      totalOutputCostUsd: round(this.totalOutputCost, 6),
+      claudeEquivalentUsd: round(this.totalClaudeEquivalent, 6),
+      savingsVsClaudePct: round(this.savingsVsClaude * 100, 2),
+      cacheHitRatio: round(this.aggregateCacheHitRatio, 4),
+      lastPromptTokens: last?.usage.promptTokens ?? this._carryoverLastPromptTokens,
+      lastTurnCostUsd: round(last?.cost ?? 0, 6),
+    };
+  }
+}
+
+function round(n: number, digits: number): number {
+  const f = 10 ** digits;
+  return Math.round(n * f) / f;
+}

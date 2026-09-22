@@ -1,0 +1,647 @@
+/** web_search uses Mojeek (DDG returns anti-bot 202 to unauthenticated POSTs); web_fetch sniffs HTML to text. */
+
+import { parse as parseHtml } from "node-html-parser";
+import { type Dispatcher, ProxyAgent } from "undici";
+import {
+  loadMetasoApiKey,
+  webSearchEndpoint as loadWebSearchEndpoint,
+  webSearchEngine as loadWebSearchEngine,
+} from "../config.js";
+import { t } from "../i18n/index.js";
+import type { ToolRegistry } from "../tools.js";
+
+export interface SearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+export interface PageContent {
+  url: string;
+  title?: string;
+  text: string;
+  /** True when the extracted text was clipped to fit the cap. */
+  truncated: boolean;
+}
+
+export interface WebFetchOptions {
+  /** Max bytes of extracted text. Defaults to 32_000 to match tool-result cap. */
+  maxChars?: number;
+  /** Timeout in ms. Defaults to 15_000. */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface WebSearchOptions {
+  topK?: number;
+  signal?: AbortSignal;
+  /** Backend engine: "mojeek" (scrapes Mojeek HTML), "searxng" (self-hosted SearXNG JSON API), or "metaso" (Metaso API). */
+  engine?: "mojeek" | "searxng" | "metaso";
+  /** Base URL for SearXNG. Default http://localhost:8080. */
+  endpoint?: string;
+}
+
+const DEFAULT_FETCH_MAX_CHARS = 32_000;
+const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
+const DEFAULT_TOPK = 5;
+/** Bytes cap applied before `resp.text()` — char cap can't fire until the body is fully buffered. */
+const FETCH_MAX_BYTES = 10 * 1024 * 1024;
+// Real-browser UA. Servers like Mojeek are bot-friendly but still gate
+// obvious scraper UAs; a stock Chrome string avoids the fast-path block.
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const MOJEEK_ENDPOINT = "https://www.mojeek.com/search";
+const METASO_ENDPOINT = "https://metaso.cn/api/v1";
+/** Search/fetch hard timeout. Without it a blackholed connection (e.g. an
+ * international engine blocked by a firewall) hangs until the caller aborts,
+ * which can stall the whole agent stream until an upstream gateway cuts it. */
+const SEARCH_TIMEOUT_MS = 15_000;
+
+type FetchInit = RequestInit & { dispatcher?: Dispatcher };
+
+/** Outbound proxy for the international web tools (Mojeek search + web_fetch).
+ * Domestic engines (Metaso) and self-hosted SearXNG skip it. Built once from
+ * SILICONCODE_WEB_PROXY / HTTPS_PROXY / HTTP_PROXY / ALL_PROXY; null when unset. */
+let _webProxy: Dispatcher | null | undefined;
+function webProxyDispatcher(): Dispatcher | undefined {
+  if (_webProxy === undefined) {
+    const url =
+      process.env.SILICONCODE_WEB_PROXY ||
+      process.env.HTTPS_PROXY ||
+      process.env.https_proxy ||
+      process.env.HTTP_PROXY ||
+      process.env.http_proxy ||
+      process.env.ALL_PROXY ||
+      process.env.all_proxy ||
+      "";
+    _webProxy = url ? new ProxyAgent(url) : null;
+  }
+  return _webProxy ?? undefined;
+}
+
+/** fetch with an internal timeout (fail fast instead of hanging the stream),
+ * caller-signal forwarding, and an optional outbound proxy. */
+async function fetchWeb(
+  url: string,
+  init: FetchInit,
+  o: { timeoutMs: number; signal?: AbortSignal; proxy?: boolean },
+): Promise<Response> {
+  const ctl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctl.abort();
+  }, o.timeoutMs);
+  const cancel = () => ctl.abort();
+  o.signal?.addEventListener("abort", cancel, { once: true });
+  const dispatcher = o.proxy ? webProxyDispatcher() : undefined;
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: ctl.signal,
+      ...(dispatcher ? { dispatcher } : {}),
+    } as FetchInit);
+  } catch (err) {
+    if (timedOut) throw new Error(t("webErrors.searchTimeout", { ms: o.timeoutMs }));
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    o.signal?.removeEventListener("abort", cancel);
+  }
+}
+
+/** Pick a status-specific webErrors key so the model gets an actionable hint, not a bare status. */
+function searchStatusError(status: number): string {
+  if (status === 429) return t("webErrors.rateLimit429");
+  if (status === 403) return t("webErrors.forbidden403");
+  if (status >= 500 && status <= 599) return t("webErrors.serverError5xx", { status });
+  return t("webErrors.status", { status });
+}
+
+function fetchStatusError(status: number, url: string): string {
+  if (status === 429) return t("webErrors.fetchRateLimit429", { url });
+  if (status === 403) return t("webErrors.fetchForbidden403", { url });
+  if (status >= 500 && status <= 599) return t("webErrors.fetchServerError5xx", { status, url });
+  return t("webErrors.fetchStatus", { status, url });
+}
+
+/** Distinguishes "truly 0 results" from "layout changed / blocked" so callers can tell. */
+export async function webSearch(
+  query: string,
+  opts: WebSearchOptions = {},
+): Promise<SearchResult[]> {
+  if (opts.engine === "metaso") {
+    return searchMetaso(query, opts);
+  }
+  if (opts.engine === "searxng") {
+    return searchSearxng(query, opts);
+  }
+  return searchMojeek(query, opts);
+}
+
+async function searchMojeek(query: string, opts: WebSearchOptions = {}): Promise<SearchResult[]> {
+  const topK = Math.max(1, Math.min(10, opts.topK ?? DEFAULT_TOPK));
+  const resp = await fetchWeb(
+    `${MOJEEK_ENDPOINT}?q=${encodeURIComponent(query)}`,
+    {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      redirect: "follow",
+    },
+    { timeoutMs: SEARCH_TIMEOUT_MS, signal: opts.signal, proxy: true },
+  );
+  if (!resp.ok) throw new Error(searchStatusError(resp.status));
+  const html = await resp.text();
+  const results = parseMojeekResults(html).slice(0, topK);
+  if (results.length === 0) {
+    if (/no results found|did not match any documents/i.test(html)) return [];
+    if (/captcha|verify you are human|access denied|forbidden/i.test(html)) {
+      throw new Error(t("webErrors.mojeekBlocked"));
+    }
+    throw new Error(
+      t("webErrors.mojeekNoResults", {
+        chars: html.length,
+        preview: html.slice(0, 120).replace(/\s+/g, " "),
+      }),
+    );
+  }
+  return results;
+}
+
+/** Parse + validate a SearXNG endpoint. Returns origin (protocol + host). */
+function normalizeSearxngEndpoint(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw.includes("://") ? raw : `http://${raw}`);
+  } catch {
+    throw new Error(t("webErrors.invalidEndpoint", { endpoint: raw }));
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(t("webErrors.endpointMustBeHttp", { protocol: url.protocol }));
+  }
+  return url.origin;
+}
+
+async function searchSearxng(query: string, opts: WebSearchOptions = {}): Promise<SearchResult[]> {
+  const topK = Math.max(1, Math.min(10, opts.topK ?? DEFAULT_TOPK));
+  const baseUrl = normalizeSearxngEndpoint(opts.endpoint ?? "http://localhost:8080");
+
+  // JSON API is often blocked by SearXNG's default limiter; HTML always works.
+  const url = `${baseUrl}/search?format=html&q=${encodeURIComponent(query)}`;
+  let resp: Response;
+  try {
+    resp = await fetchWeb(
+      url,
+      { headers: { "User-Agent": USER_AGENT, Accept: "text/html" } },
+      { timeoutMs: SEARCH_TIMEOUT_MS, signal: opts.signal },
+    );
+  } catch (err) {
+    if (err instanceof TypeError && (err as Error).message.includes("fetch")) {
+      throw new Error(
+        t("webErrors.cannotReach", { endpoint: opts.endpoint ?? "http://localhost:8080" }),
+      );
+    }
+    throw err;
+  }
+  if (!resp.ok) throw new Error(searchStatusError(resp.status));
+  const html = await resp.text();
+  const results = parseSearxngHtmlResults(html).slice(0, topK);
+  if (results.length === 0) {
+    if (/no results found|did not match any documents/i.test(html)) return [];
+    throw new Error(t("webErrors.searxngNoResults", { chars: html.length }));
+  }
+  return results;
+}
+
+interface MetasoWebpage {
+  title: string;
+  link: string;
+  snippet?: string;
+  summary?: string;
+  score?: string;
+  position?: number;
+  date?: string;
+}
+
+interface MetasoSearchResponse {
+  credits?: number;
+  total?: number;
+  webpages?: MetasoWebpage[];
+  code?: number;
+  message?: string;
+}
+
+async function searchMetaso(query: string, opts: WebSearchOptions = {}): Promise<SearchResult[]> {
+  const topK = Math.max(1, Math.min(100, opts.topK ?? DEFAULT_TOPK));
+  const apiKey = loadMetasoApiKey();
+
+  let resp: Response;
+  try {
+    resp = await fetchWeb(
+      `${METASO_ENDPOINT}/search`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ q: query, scope: "webpage", size: topK }),
+      },
+      { timeoutMs: SEARCH_TIMEOUT_MS, signal: opts.signal },
+    );
+  } catch (err) {
+    if (err instanceof TypeError && (err as Error).message.includes("fetch")) {
+      throw new Error(t("webErrors.cannotReach", { endpoint: METASO_ENDPOINT }));
+    }
+    throw err;
+  }
+
+  const raw = await resp.text();
+  let data: MetasoSearchResponse;
+  try {
+    data = JSON.parse(raw) as MetasoSearchResponse;
+  } catch {
+    throw new Error(t("webErrors.metasoParseError", { status: resp.status }));
+  }
+
+  if (!resp.ok) {
+    if (resp.status === 401 || resp.status === 403) {
+      throw new Error(t("webErrors.metasoUnauthorized"));
+    }
+    if (resp.status === 429) {
+      throw new Error(t("webErrors.metasoRateLimit"));
+    }
+    throw new Error(t("webErrors.metasoServerError", { status: resp.status }));
+  }
+
+  if (data.code === 3003) {
+    throw new Error(t("webErrors.metasoDailyLimit"));
+  }
+  if (data.code === 2005) {
+    throw new Error(t("webErrors.metasoUnauthorized"));
+  }
+  if (data.code && data.code !== 0) {
+    throw new Error(
+      t("webErrors.metasoApiError", { code: data.code, message: data.message ?? "" }),
+    );
+  }
+
+  const webpages = data.webpages ?? [];
+  if (webpages.length === 0) {
+    return [];
+  }
+
+  return webpages.slice(0, topK).map((wp) => ({
+    title: wp.title,
+    url: wp.link,
+    snippet: wp.snippet ?? wp.summary ?? "",
+  }));
+}
+
+/** Parse SearXNG HTML search results using node-html-parser. */
+export function parseSearxngHtmlResults(html: string): SearchResult[] {
+  const root = parseHtml(html);
+  const results: SearchResult[] = [];
+
+  // Try <article class="result"> first (default SearXNG theme)
+  const articles = root.querySelectorAll("article.result, div.result");
+  if (articles.length > 0) {
+    for (const article of articles) {
+      const link = article.querySelector("h3 a, h4 a, a[href^='http']");
+      if (!link) continue;
+      const href = link.getAttribute("href");
+      if (!href) continue;
+      const title = link.textContent.trim();
+      if (!title) continue;
+      let snippet = "";
+      for (const p of article.querySelectorAll("p")) {
+        const text = p.textContent.trim();
+        if (text.length > 10 && !text.includes(title)) {
+          snippet = text;
+          break;
+        }
+      }
+      if (!snippet) {
+        const cs = article.querySelector(".content, .result-content, [class*='snippet']");
+        if (cs) snippet = cs.textContent.trim();
+      }
+      results.push({ title, url: href, snippet });
+    }
+    return results;
+  }
+
+  // Fallback: <h3><a href> pairs directly
+  for (const a of root.querySelectorAll("h3 a[href]")) {
+    const href = a.getAttribute("href");
+    if (!href || href.startsWith("#")) continue;
+    const title = a.textContent.trim();
+    if (!title) continue;
+    let snippet = "";
+    const p = a.parentNode?.parentNode?.querySelector("p");
+    if (p) snippet = p.textContent.trim();
+    results.push({ title, url: href, snippet });
+  }
+  return results;
+}
+
+/** Title-anchor + snippet-paragraph passes paired positionally — robust to attribute reorder. */
+export function parseMojeekResults(html: string): SearchResult[] {
+  const titles: string[] = [];
+  const titleAnchorRe = /<a\b[^>]*\bclass="title"[^>]*>[\s\S]*?<\/a>/g;
+  let m: RegExpExecArray | null;
+  while (true) {
+    m = titleAnchorRe.exec(html);
+    if (m === null) break;
+    titles.push(m[0]);
+  }
+
+  const snippets: string[] = [];
+  const snippetRe = /<p\b[^>]*\bclass="s"[^>]*>([\s\S]*?)<\/p>/g;
+  while (true) {
+    m = snippetRe.exec(html);
+    if (m === null) break;
+    snippets.push(m[1] ?? "");
+  }
+
+  const hrefRe = /href="([^"]+)"/;
+  const innerRe = /<a\b[^>]*>([\s\S]*?)<\/a>/;
+  const results: SearchResult[] = [];
+  for (let i = 0; i < titles.length; i++) {
+    const anchor = titles[i]!;
+    const hrefMatch = anchor.match(hrefRe);
+    const innerMatch = anchor.match(innerRe);
+    if (!hrefMatch?.[1]) continue;
+    results.push({
+      title: decodeHtmlEntities(stripHtml(innerMatch?.[1] ?? "")).trim(),
+      url: hrefMatch[1],
+      snippet: decodeHtmlEntities(stripHtml(snippets[i] ?? ""))
+        .replace(/\s+/g, " ")
+        .trim(),
+    });
+  }
+  return results;
+}
+
+export async function webFetch(url: string, opts: WebFetchOptions = {}): Promise<PageContent> {
+  const maxChars = opts.maxChars ?? DEFAULT_FETCH_MAX_CHARS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+  const ctl = new AbortController();
+  // Track whether the abort came from our internal timer vs the caller's
+  // signal — only the timer-driven abort should produce a "timed out" hint.
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctl.abort();
+  }, timeoutMs);
+  // Forward the caller's abort too so an Esc during a long fetch is respected.
+  const cancel = () => ctl.abort();
+  opts.signal?.addEventListener("abort", cancel, { once: true });
+  let resp: Response;
+  try {
+    const dispatcher = webProxyDispatcher();
+    resp = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT, Accept: "text/html,text/plain,*/*" },
+      signal: ctl.signal,
+      redirect: "follow",
+      ...(dispatcher ? { dispatcher } : {}),
+    } as FetchInit);
+  } catch (err) {
+    if (timedOut) {
+      throw new Error(t("webErrors.fetchTimeout", { ms: timeoutMs, url }));
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", cancel);
+  }
+  if (!resp.ok) throw new Error(fetchStatusError(resp.status, url));
+  const contentType = resp.headers.get("content-type") ?? "";
+  // Pre-check Content-Length when the server provides it. Cheaper to
+  // refuse upfront than to start streaming a 1GB ISO.
+  const declaredLen = Number(resp.headers.get("content-length") ?? "");
+  if (Number.isFinite(declaredLen) && declaredLen > FETCH_MAX_BYTES) {
+    throw new Error(t("webErrors.fetchTooLarge", { len: declaredLen, cap: FETCH_MAX_BYTES, url }));
+  }
+  const raw = await readBodyCapped(resp, FETCH_MAX_BYTES);
+  const title = extractTitle(raw);
+  const text = contentType.includes("text/html") ? htmlToText(raw) : raw;
+  const truncated = text.length > maxChars;
+  const finalText = truncated
+    ? `${text.slice(0, maxChars)}\n\n[… truncated ${text.length - maxChars} chars …]`
+    : text;
+  return { url, title, text: finalText, truncated };
+}
+
+/** Streams + caps so chunked responses (or servers lying about Content-Length) can't balloon the heap. */
+async function readBodyCapped(resp: Response, maxBytes: number): Promise<string> {
+  if (!resp.body) return await resp.text();
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let total = 0;
+  let out = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          /* already torn down */
+        }
+        throw new Error(t("webErrors.fetchBodyTooLarge", { cap: maxBytes, seen: total }));
+      }
+      out += decoder.decode(value, { stream: true });
+    }
+    out += decoder.decode();
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* reader already cancelled / released */
+    }
+  }
+  return out;
+}
+
+/** Hard cap so the per-request HTML budget stays linear-time even on adversarial pages. */
+const MAX_HTML_INPUT = 5 * 1024 * 1024;
+
+const STRIP_BLOCK_TAGS = "script, style, noscript, nav, footer, aside, svg";
+
+/** Block-level tags that should produce a paragraph break in the extracted text. */
+const BLOCK_BREAK_TAGS = new Set([
+  "p",
+  "div",
+  "br",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "li",
+  "tr",
+  "section",
+  "article",
+]);
+
+export function htmlToText(html: string): string {
+  const input = html.length > MAX_HTML_INPUT ? html.slice(0, MAX_HTML_INPUT) : html;
+  // Real HTML parser — sidesteps the well-known regex anti-patterns
+  // (`<X[\s\S]*?</X>`, `<[^>]+>`) CodeQL flags as bad-tag-filter and
+  // incomplete-multi-character-sanitization.
+  const root = parseHtml(input);
+  for (const node of root.querySelectorAll(STRIP_BLOCK_TAGS)) node.remove();
+
+  const out: string[] = [];
+  walkExtract(root, out);
+  let s = out.join("");
+  s = decodeHtmlEntities(s);
+  s = s.replace(/[ \t]+/g, " ");
+  s = s.replace(/\n[ \t]+/g, "\n");
+  s = s.replace(/\n{3,}/g, "\n\n");
+  return s.trim();
+}
+
+interface WalkableNode {
+  nodeType: number;
+  rawText?: string;
+  text?: string;
+  rawTagName?: string;
+  childNodes: WalkableNode[];
+}
+
+function walkExtract(node: WalkableNode, out: string[]): void {
+  // nodeType 3 = TEXT_NODE; 1 = ELEMENT_NODE per node-html-parser.
+  if (node.nodeType === 3) {
+    out.push(node.rawText ?? node.text ?? "");
+    return;
+  }
+  const tag = node.rawTagName?.toLowerCase();
+  const isBreak = tag !== undefined && BLOCK_BREAK_TAGS.has(tag);
+  if (isBreak) out.push("\n");
+  for (const child of node.childNodes) walkExtract(child, out);
+  if (isBreak) out.push("\n");
+}
+
+function stripHtml(s: string): string {
+  return parseHtml(s).text;
+}
+
+const HTML_ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+};
+
+/** Single-pass decode — the previous chained `replace`s decoded `&amp;lt;` into `<` because `&amp;` ran before `&lt;`. */
+function decodeHtmlEntities(s: string): string {
+  return s.replace(/&(#\d+|#x[0-9a-fA-F]+|\w+);/g, (raw, name: string) => {
+    if (name.startsWith("#x") || name.startsWith("#X")) {
+      const code = Number.parseInt(name.slice(2), 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : raw;
+    }
+    if (name.startsWith("#")) {
+      const code = Number.parseInt(name.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : raw;
+    }
+    return HTML_ENTITIES[name.toLowerCase()] ?? raw;
+  });
+}
+
+function extractTitle(html: string): string | undefined {
+  const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (!m?.[1]) return undefined;
+  return m[1].replace(/\s+/g, " ").trim() || undefined;
+}
+
+export interface WebToolsOptions {
+  /** Default top-K for `web_search` when the model doesn't specify. */
+  defaultTopK?: number;
+  /** Byte cap for `web_fetch` extracted text. */
+  maxFetchChars?: number;
+  /** Backend engine: "mojeek" (default, scrapes Mojeek), "searxng" (self-hosted SearXNG), or "metaso" (Metaso API). */
+  webSearchEngine?: "mojeek" | "searxng" | "metaso";
+  /** Base URL for SearXNG (default http://localhost:8080). */
+  webSearchEndpoint?: string;
+}
+
+export function registerWebTools(registry: ToolRegistry, opts: WebToolsOptions = {}): ToolRegistry {
+  const defaultTopK = opts.defaultTopK ?? DEFAULT_TOPK;
+  const maxFetchChars = opts.maxFetchChars ?? DEFAULT_FETCH_MAX_CHARS;
+
+  registry.register({
+    name: "web_search",
+    description:
+      "Search the public web. Returns ranked results with title, url, and snippet. Call this when the answer's correctness depends on current state — anything that changes over time (events, prices, releases, status of a thing in the real world). Composing such answers from training memory invents stale numbers; search first, then ground the answer in the results. For evergreen / definitional questions you don't need this." +
+      " To change the backend, use /search-engine mojeek|searxng|metaso.",
+    readOnly: true,
+    parallelSafe: true,
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Natural-language search query." },
+        topK: {
+          type: "integer",
+          description: `Number of results to return (1..10). Default ${defaultTopK}.`,
+        },
+      },
+      required: ["query"],
+    },
+    fn: async (args: { query: string; topK?: number }, ctx) => {
+      const engine = opts.webSearchEngine ?? loadWebSearchEngine();
+      const endpoint = opts.webSearchEndpoint ?? loadWebSearchEndpoint();
+      const results = await webSearch(args.query, {
+        topK: args.topK ?? defaultTopK,
+        signal: ctx?.signal,
+        engine,
+        endpoint,
+      });
+      return formatSearchResults(args.query, results);
+    },
+  });
+
+  registry.register({
+    name: "web_fetch",
+    description:
+      "Download a URL and return its visible text content (HTML pages get scripts/styles/nav stripped). Truncated at the tool-result cap. Use after web_search when a snippet isn't enough.",
+    readOnly: true,
+    parallelSafe: true,
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Absolute http:// or https:// URL." },
+      },
+      required: ["url"],
+    },
+    fn: async (args: { url: string }, ctx) => {
+      if (!/^https?:\/\//i.test(args.url)) {
+        throw new Error(t("webErrors.fetchInvalidUrl"));
+      }
+      const page = await webFetch(args.url, { maxChars: maxFetchChars, signal: ctx?.signal });
+      const header = page.title ? `${page.title}\n${page.url}` : page.url;
+      return `${header}\n\n${page.text}`;
+    },
+  });
+
+  return registry;
+}
+
+export function formatSearchResults(query: string, results: SearchResult[]): string {
+  const lines: string[] = [`query: ${query}`, `\nresults (${results.length}):`];
+  results.forEach((r, i) => {
+    lines.push(`\n${i + 1}. ${r.title}`);
+    lines.push(`   ${r.url}`);
+    if (r.snippet) lines.push(`   ${r.snippet}`);
+  });
+  return lines.join("\n");
+}

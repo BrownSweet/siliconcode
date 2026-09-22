@@ -1,0 +1,821 @@
+// First import — re-execs the process with a bigger V8 heap when Node's
+// stock 2 GiB cap is in force (issue #1011). Side-effect on module load,
+// before any heavy import below runs.
+import "./heap-limit-launch.js";
+
+import { Command } from "commander";
+import { readConfig } from "../config.js";
+import {
+  flushDiagnostics,
+  installProcessDiagnostics,
+  reportDiagnosticError,
+} from "../diagnostics.js";
+import { t } from "../i18n/index.js";
+import { VERSION } from "../index.js";
+import { listSessions } from "../memory/session.js";
+import { applyMemoryStack } from "../memory/user.js";
+import { installProxyIfConfigured } from "../net/proxy.js";
+import { escalationContract } from "../prompt-fragments.js";
+import { startCpuProfile, stopAndSaveCpuProfile } from "./cpu-prof.js";
+import { resolveDashboardHost, resolveDashboardToken } from "./dashboard-options.js";
+import { parseNonNegativeIntegerOption, parsePositiveIntegerOption } from "./number-options.js";
+import { resolveBareCommandMode, resolveContinueFlag, resolveDefaults } from "./resolve.js";
+import { markPhase } from "./startup-profile.js";
+
+async function maybeStartCpuProfile(flag: unknown): Promise<boolean> {
+  if (flag === undefined || flag === false) return false;
+  await startCpuProfile(typeof flag === "string" ? flag : undefined);
+  return true;
+}
+
+// HTTPS_PROXY / HTTP_PROXY only reach Node's fetch via undici's global
+// dispatcher; install before any client (DeepSeek, web tools, dashboard)
+// constructs a fetch closure. Issue #646.
+installProxyIfConfigured();
+installProcessDiagnostics();
+
+markPhase("cli_module_loaded");
+
+function defaultSystemPrompt(modelId: string): string {
+  return `You are Silicon Code, a helpful DeepSeek-powered coding assistant for Chinese-first developer workflows. Be concise and accurate. Use tools when available. Reply in the user's language — default to Simplified Chinese when it's unclear; keep code, file paths, and shell commands verbatim.
+
+# Cite or shut up — non-negotiable
+
+Every factual claim about a codebase must be backed by evidence. Silicon Code validates your citations — broken paths render in **red strikethrough with ❌** in front of the user.
+
+**Positive claims** — append a markdown link:
+- ✅ \`The MCP client supports listResources [listResources](src/mcp/client.ts:142).\`
+- ❌ \`The MCP client supports listResources.\` ← unverifiable, do not write.
+
+**Negative claims** ("X is missing", "Y isn't implemented", "lacks Z") are the #1 hallucination shape. STOP before writing them. If you have a search tool, call it first; if the search returns nothing, cite the search itself as evidence (\`No matches for "foo" in src/\`). If you have no tool, qualify hard: "I haven't verified — this is a guess."
+
+Asserting absence without checking is how evaluative answers go wrong. Treat the urge to write "missing" as a red flag in your own reasoning.
+
+# Don't invent what changes — search instead
+
+Your training data has a cutoff. When an answer's correctness depends on something that changes over time (the user is asking what's happening, not what's true) and a search tool is available, search first. Inventing currently-correct values from training memory is the most common way these answers go wrong, and the user usually can't tell until much later.
+
+The signal isn't a topic list — it's: "if I'm wrong about this, is it because reality moved on?". If yes, ground the answer in fresh evidence; if no (definitions, mechanisms, well-established APIs), answer from memory.
+
+${escalationContract(modelId)}`;
+}
+
+/** Lenient: malformed → undefined (no cap) so a bad flag doesn't abort launch. */
+function parseBudgetFlag(raw: number | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  if (!Number.isFinite(raw) || raw <= 0) {
+    process.stderr.write(
+      `▲ ignoring --budget=${raw} (must be a positive number) — running with no cap\n`,
+    );
+    return undefined;
+  }
+  return raw;
+}
+
+/** Lenient port parser — bad value warns + falls back to ephemeral, same shape as parseBudgetFlag. */
+function parseDashboardPortFlag(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    process.stderr.write(`${t("ui.dashboardPortInvalid", { value: raw })}\n`);
+    return undefined;
+  }
+  return n;
+}
+
+function resolveDashboardPort(
+  flagValue: number | undefined,
+  noConfig: boolean,
+): number | undefined {
+  if (flagValue !== undefined) return flagValue;
+  if (noConfig) return undefined;
+  const fromCfg = readConfig().dashboard?.port;
+  return typeof fromCfg === "number" &&
+    Number.isInteger(fromCfg) &&
+    fromCfg >= 1 &&
+    fromCfg <= 65535
+    ? fromCfg
+    : undefined;
+}
+
+const program = new Command();
+program
+  .name("brown")
+  .description(t("cli.description"))
+  .version(VERSION)
+  .option("-c, --continue", t("cli.continue"));
+
+// `brown` with no subcommand → setup wizard on first run, otherwise `code`
+// in the current directory. Filesystem-less chat stays reachable via
+// `brown chat`.
+program.action(async (opts: { continue?: boolean }) => {
+  const cfg = readConfig();
+  const mode = resolveBareCommandMode(cfg);
+  if (mode === "setup") {
+    const { setupCommand } = await import("./commands/setup.js");
+    await setupCommand({ forceKeyStep: true });
+    return;
+  }
+  const { codeCommand } = await import("./commands/code.js");
+  // Claude-parity: a bare launch starts a FRESH session; `-c/--continue` resumes
+  // the most recent. (Previously the default auto-resumed, which surprised users.)
+  await codeCommand({
+    dir: process.cwd(),
+    forceResume: !!opts.continue,
+    forceNew: !opts.continue,
+  });
+});
+
+program
+  .command("setup")
+  .description(t("cli.setup"))
+  .action(async () => {
+    const { setupCommand } = await import("./commands/setup.js");
+    await setupCommand({ forceKeyStep: true });
+  });
+
+program
+  .command("init [dir]")
+  .description(t("cli.init"))
+  .option("--force", t("ui.initForceHint"))
+  .option("--dry-run", t("ui.initDryRunHint"))
+  .option("--json", t("ui.initJsonHint"))
+  .option("-y, --yes", t("ui.initYesHint"))
+  .action(async (dir: string | undefined, opts) => {
+    const { initCommand } = await import("./commands/init.js");
+    const result = await initCommand({
+      dir,
+      force: !!opts.force,
+      dryRun: !!opts.dryRun,
+      json: !!opts.json,
+      yes: !!opts.yes,
+    });
+    if (result.status === "exists" || result.status === "needs-confirmation") {
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("code [dir]")
+  .description(t("cli.code"))
+  .option("-m, --model <id>", t("ui.modelOverride"))
+  .option("--no-session", t("ui.noSession"))
+  .option("-r, --resume", t("ui.resumeHint"))
+  .option("-n, --new", t("ui.newHint"))
+  .option("--transcript <path>", t("ui.transcriptHint"))
+  .option("--budget <usd>", t("ui.budgetHint"), (v) => Number.parseFloat(v))
+  .option("--no-dashboard", t("ui.noDashboard"))
+  .option("--open-dashboard", t("ui.openDashboardHint"))
+  .option("--dashboard-port <port>", t("ui.dashboardPortHint"))
+  .option(
+    "--dashboard-host <host>",
+    "bind address for the dashboard (default 127.0.0.1; use 0.0.0.0 for LAN access — the URL token is then the only auth)",
+  )
+  .option("--system-append <prompt>", t("ui.systemAppendHint"))
+  .option("--system-append-file <path>", t("ui.systemAppendFileHint"))
+  .option("--collab", "enable local collaboration mode (.siliconcode/collab)")
+  .option("--agent <name>", "collaboration agent identity (default siliconcode)", "siliconcode")
+  .option("--collab-root <path>", "collaboration root (default <project>/.siliconcode/collab)")
+  .option(
+    "--profile [path]",
+    "record a V8 CPU profile; saved on exit. Send the .cpuprofile back if you're reporting a perf bug.",
+  )
+  .action(async (dir: string | undefined, opts) => {
+    const profiling = await maybeStartCpuProfile(opts.profile);
+    try {
+      const { codeCommand } = await import("./commands/code.js");
+      await codeCommand({
+        dir,
+        model: opts.model,
+        noSession: opts.session === false,
+        transcript: opts.transcript,
+        // Claude-parity: fresh by default; `-r/--resume` resumes the latest. `-n/--new`
+        // is kept as an explicit alias of the (now default) fresh-start behavior.
+        forceResume: !!opts.resume,
+        forceNew: !opts.resume,
+        budgetUsd: parseBudgetFlag(opts.budget),
+        noDashboard: opts.dashboard === false,
+        openDashboard: opts.openDashboard === true,
+        dashboardPort: resolveDashboardPort(parseDashboardPortFlag(opts.dashboardPort), false),
+        dashboardHost: resolveDashboardHost(opts.dashboardHost, false),
+        dashboardToken: resolveDashboardToken(false),
+        systemAppend: opts.systemAppend,
+        systemAppendFile: opts.systemAppendFile,
+        collab: opts.collab === true,
+        collabAgent: opts.agent,
+        collabRoot: opts.collabRoot,
+      });
+    } finally {
+      if (profiling) await stopAndSaveCpuProfile();
+    }
+  });
+
+program
+  .command("chat")
+  .description(t("cli.chat"))
+  .option("-m, --model <id>", t("ui.modelIdHint"))
+  .option("-s, --system <prompt>", t("ui.systemPromptHint"))
+  .option("--transcript <path>", t("ui.transcriptHint"))
+  .option("--preset <name>", t("ui.presetHint"))
+  .option("--budget <usd>", t("ui.budgetHint"), (v) => Number.parseFloat(v))
+  .option("--session <name>", t("ui.sessionNameHint"))
+  .option("--no-session", t("ui.ephemeralHint"))
+  .option("-r, --resume", t("ui.resumeHint"))
+  .option("-c, --continue", t("cli.continue"))
+  .option("-n, --new", t("ui.newHint"))
+  .option(
+    "--mcp <spec>",
+    t("ui.mcpSpecHint"),
+    (value: string, previous: string[] = []) => [...previous, value],
+    [] as string[],
+  )
+  .option("--mcp-prefix <str>", t("ui.mcpPrefixHint"))
+  .option("--no-config", t("ui.noConfigHint"))
+  .option("--no-dashboard", t("ui.noDashboard"))
+  .option("--open-dashboard", t("ui.openDashboardHint"))
+  .option("--dashboard-port <port>", t("ui.dashboardPortHint"))
+  .option(
+    "--dashboard-host <host>",
+    "bind address for the dashboard (default 127.0.0.1; use 0.0.0.0 for LAN access — the URL token is then the only auth)",
+  )
+  .option(
+    "--profile [path]",
+    "record a V8 CPU profile; saved on exit. Send the .cpuprofile back if you're reporting a perf bug.",
+  )
+  .action(async (opts) => {
+    const profiling = await maybeStartCpuProfile(opts.profile);
+    try {
+      const defaults = resolveDefaults({
+        model: opts.model,
+        mcp: opts.mcp as string[],
+        session: opts.session,
+        preset: opts.preset,
+        noConfig: opts.config === false,
+      });
+      // `-c` is "newest-touched session" + auto-resume; `-r` is "this
+      // session's prior messages, even if you also passed --session".
+      // When both are set we prefer the explicit `--session` + `-r`
+      // (more specific input wins). `-c` only kicks in if `-r` wasn't.
+      const continueOpts = opts.resume
+        ? { session: defaults.session, forceResume: true }
+        : resolveContinueFlag(
+            opts.continue,
+            defaults.session,
+            () => listSessions()[0],
+            (msg) => process.stderr.write(`${msg}\n`),
+          );
+      const { chatCommand } = await import("./commands/chat.js");
+      const chatBase = opts.system ?? defaultSystemPrompt(defaults.model);
+      const chatCwd = process.cwd();
+      const chatRebuildSystem = () => applyMemoryStack(chatBase, chatCwd);
+      await chatCommand({
+        model: defaults.model,
+        system: chatRebuildSystem(),
+        rebuildSystem: chatRebuildSystem,
+        transcript: opts.transcript,
+        budgetUsd: parseBudgetFlag(opts.budget),
+        session: continueOpts.session,
+        mcp: defaults.mcp,
+        mcpPrefix: opts.mcpPrefix,
+        forceResume: continueOpts.forceResume,
+        forceNew: !!opts.new,
+        noDashboard: opts.dashboard === false,
+        openDashboard: opts.openDashboard === true,
+        dashboardPort: resolveDashboardPort(
+          parseDashboardPortFlag(opts.dashboardPort),
+          opts.config === false,
+        ),
+        dashboardHost: resolveDashboardHost(opts.dashboardHost, opts.config === false),
+        dashboardToken: resolveDashboardToken(opts.config === false),
+      });
+    } finally {
+      if (profiling) await stopAndSaveCpuProfile();
+    }
+  });
+
+program
+  .command("run <task>")
+  .description(t("cli.run"))
+  .option("-m, --model <id>", t("ui.modelIdHint"))
+  .option("-s, --system <prompt>", t("ui.systemPromptHint"))
+  .option("--preset <name>", t("ui.presetHintShort"))
+  .option("--budget <usd>", t("ui.budgetHintShort"), (v) => Number.parseFloat(v))
+  .option("--transcript <path>", t("ui.transcriptHintShort"))
+  .option(
+    "--mcp <spec>",
+    t("ui.mcpSpecHintShort"),
+    (value: string, previous: string[] = []) => [...previous, value],
+    [] as string[],
+  )
+  .option("--mcp-prefix <str>", t("ui.mcpPrefixHintShort"))
+  .option("--no-config", t("ui.noConfigHint"))
+  .action(async (task: string, opts) => {
+    const defaults = resolveDefaults({
+      model: opts.model,
+      mcp: opts.mcp as string[],
+      preset: opts.preset,
+      noConfig: opts.config === false,
+    });
+    const { runCommand } = await import("./commands/run.js");
+    await runCommand({
+      task,
+      model: defaults.model,
+      system: applyMemoryStack(opts.system ?? defaultSystemPrompt(defaults.model), process.cwd()),
+      budgetUsd: parseBudgetFlag(opts.budget),
+      transcript: opts.transcript,
+      mcp: defaults.mcp,
+      mcpPrefix: opts.mcpPrefix,
+    });
+  });
+
+program
+  .command("acp")
+  .description("run Silicon Code as an Agent Client Protocol (ACP) agent on stdio NDJSON JSON-RPC")
+  .option("-m, --model <id>", t("ui.modelIdHint"))
+  .option("--dir <path>", "root directory for filesystem tools (default: cwd)")
+  .option("--preset <name>", t("ui.presetHintShort"))
+  .option("--budget <usd>", t("ui.budgetHintShort"), (v) => Number.parseFloat(v))
+  .option("--transcript <path>", t("ui.transcriptHint"))
+  .option("--yolo", t("ui.yoloHint"))
+  .option(
+    "--mcp <spec>",
+    t("ui.mcpSpecHintShort"),
+    (value: string, previous: string[] = []) => [...previous, value],
+    [] as string[],
+  )
+  .option("--mcp-prefix <str>", t("ui.mcpPrefixHintShort"))
+  .action(async (opts) => {
+    const defaults = resolveDefaults({
+      model: opts.model,
+      mcp: opts.mcp as string[],
+      preset: opts.preset,
+      noConfig: false,
+    });
+    const { acpCommand } = await import("./commands/acp.js");
+    await acpCommand({
+      model: defaults.model,
+      budgetUsd: parseBudgetFlag(opts.budget),
+      dir: opts.dir,
+      transcript: opts.transcript,
+      yolo: !!opts.yolo,
+      mcpSpecs: defaults.mcp,
+      mcpPrefix: opts.mcpPrefix,
+    });
+  });
+
+program
+  .command("desktop")
+  .description("headless JSON-RPC chat for the desktop client (internal)")
+  .option("-m, --model <id>", t("ui.modelIdHint"))
+  .option("--dir <path>", "root directory for filesystem tools (default: cwd)")
+  .option("--preset <name>", t("ui.presetHintShort"))
+  .option("--budget <usd>", t("ui.budgetHintShort"), (v) => Number.parseFloat(v))
+  .action(async (opts) => {
+    const { desktopCommand } = await import("./commands/desktop.js");
+    await desktopCommand({
+      // Keep this undefined unless the internal launcher explicitly passed
+      // --model. desktopCommand resolves the active provider record itself;
+      // pre-resolving here would let a stale legacy top-level model override it.
+      model: opts.model,
+      budgetUsd: parseBudgetFlag(opts.budget),
+      dir: opts.dir,
+    });
+  });
+
+program
+  .command("stats [transcript]")
+  .description(t("cli.stats"))
+  .action(async (transcript: string | undefined) => {
+    const { statsCommand } = await import("./commands/stats.js");
+    statsCommand({ transcript });
+  });
+
+program
+  .command("doctor")
+  .description(t("cli.doctor"))
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts) => {
+    const { doctorCommand } = await import("./commands/doctor.js");
+    await doctorCommand({ json: !!opts.json });
+  });
+
+program
+  .command("commit")
+  .description(t("cli.commit"))
+  .option("-m, --model <id>", t("ui.modelOverrideFlash"))
+  .option("-y, --yes", t("ui.skipConfirmHint"))
+  .action(async (opts) => {
+    const { commitCommand } = await import("./commands/commit.js");
+    await commitCommand({ model: opts.model, yes: !!opts.yes });
+  });
+
+program
+  .command("sessions [name]")
+  .description(t("cli.sessions"))
+  .option("-v, --verbose", t("ui.verboseHint"))
+  .action(async (name: string | undefined, opts) => {
+    const { sessionsCommand } = await import("./commands/sessions.js");
+    sessionsCommand({ name, verbose: !!opts.verbose });
+  });
+
+program
+  .command("prune-sessions")
+  .description(t("cli.pruneSessions"))
+  .option("--days <n>", t("ui.pruneDaysHint"), parsePositiveIntegerOption)
+  .option("--dry-run", t("ui.pruneDryRunHint"))
+  .action(async (opts) => {
+    const { pruneSessionsCommand } = await import("./commands/prune-sessions.js");
+    pruneSessionsCommand({ days: opts.days, dryRun: !!opts.dryRun });
+  });
+
+program
+  .command("events <name>")
+  .description(t("cli.events"))
+  .option("--type <type>", t("ui.eventTypeHint"))
+  .option("--since <id>", t("ui.eventSinceHint"), parseNonNegativeIntegerOption)
+  .option("--tail <n>", t("ui.eventTailHint"), parsePositiveIntegerOption)
+  .option("--json", t("ui.jsonHint"))
+  .option("--projection", t("ui.projectionHint"))
+  .action(async (name: string, opts) => {
+    const { eventsCommand } = await import("./commands/events.js");
+    eventsCommand({
+      name,
+      type: opts.type,
+      since: Number.isFinite(opts.since) ? opts.since : undefined,
+      tail: Number.isFinite(opts.tail) ? opts.tail : undefined,
+      json: !!opts.json,
+      projection: !!opts.projection,
+    });
+  });
+
+const collab = program.command("collab").description("local Silicon Code collaboration utilities");
+
+collab
+  .command("init")
+  .description("initialize .siliconcode/collab protocol files")
+  .option("--agent <name>", "this agent's collaboration identity", "siliconcode")
+  .option("--root <path>", "collaboration root (default .siliconcode/collab)")
+  .option("--force", "regenerate protocol.md and protocol.sha256")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts: { agent: string; root?: string; force?: boolean; json?: boolean }) => {
+    const { collabInitCommand } = await import("./commands/collab.js");
+    collabInitCommand({
+      agent: opts.agent,
+      root: opts.root,
+      force: !!opts.force,
+      json: !!opts.json,
+    });
+  });
+
+collab
+  .command("check")
+  .description("verify protocol.md matches protocol.sha256")
+  .option("--root <path>", "collaboration root (default .siliconcode/collab)")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts: { root?: string; json?: boolean }) => {
+    const { collabCheckCommand } = await import("./commands/collab.js");
+    collabCheckCommand({ root: opts.root, json: !!opts.json });
+  });
+
+collab
+  .command("send")
+  .description("send a JSON message to another agent inbox")
+  .requiredOption("--from <agent>", "sender agent")
+  .requiredOption("--to <agent>", "recipient agent")
+  .option("--type <type>", "message type", "note")
+  .option("--task <id>", "task id")
+  .option("--body <json>", "message body as a JSON object")
+  .option("--body-file <path>", "read message body JSON object from a file")
+  .option("--root <path>", "collaboration root (default .siliconcode/collab)")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts) => {
+    const { collabSendCommand } = await import("./commands/collab.js");
+    collabSendCommand({
+      from: opts.from,
+      to: opts.to,
+      type: opts.type,
+      task: opts.task,
+      body: opts.body,
+      bodyFile: opts.bodyFile,
+      root: opts.root,
+      json: !!opts.json,
+    });
+  });
+
+const inbox = collab.command("inbox").description("agent inbox utilities");
+
+inbox
+  .command("list")
+  .description("list messages in a worker inbox")
+  .option("--agent <name>", "worker/agent inbox name", "cbrown")
+  .option("--root <path>", "collaboration root (default .siliconcode/collab)")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts: { agent: string; root?: string; json?: boolean }) => {
+    const { inboxListCommand } = await import("./commands/collab.js");
+    inboxListCommand({ agent: opts.agent, root: opts.root, json: !!opts.json });
+  });
+
+inbox
+  .command("read")
+  .description("read unread worker inbox messages and mark them read")
+  .option("--agent <name>", "worker/agent inbox name", "cbrown")
+  .option("--root <path>", "collaboration root (default .siliconcode/collab)")
+  .option("--all", "include messages already marked read")
+  .option("--no-mark-read", "do not mark returned messages as read")
+  .option("--json", t("ui.jsonHint"))
+  .action(
+    async (opts: {
+      agent: string;
+      root?: string;
+      all?: boolean;
+      markRead?: boolean;
+      json?: boolean;
+    }) => {
+      const { inboxReadCommand } = await import("./commands/collab.js");
+      inboxReadCommand({
+        agent: opts.agent,
+        root: opts.root,
+        all: !!opts.all,
+        noMarkRead: opts.markRead === false,
+        json: !!opts.json,
+      });
+    },
+  );
+
+const task = collab.command("task").description("local cross-agent task coordination");
+
+task
+  .command("assign")
+  .requiredOption("--to <agent>", "worker/agent to assign the task to")
+  .requiredOption("--file <path>", "markdown file containing task instructions")
+  .option("--root <path>", "collaboration root (default .siliconcode/collab)")
+  .option("--title <text>", "task title override")
+  .option("--workspace <path>", "workspace path for the task", ".")
+  .option("--by <agent>", "assigning agent", "siliconcode")
+  .option("--write-scope <path>", "allowed write scope; repeatable", collectOption, [] as string[])
+  .option("--verify <cmd>", "verification command; repeatable", collectOption, [] as string[])
+  .option("--json", t("ui.jsonHint"))
+  .description("create a task and deliver it to a worker inbox")
+  .action(async (opts) => {
+    const { taskAssignCommand } = await import("./commands/collab.js");
+    taskAssignCommand({
+      to: opts.to,
+      file: opts.file,
+      root: opts.root,
+      title: opts.title,
+      workspace: opts.workspace,
+      by: opts.by,
+      writeScope: opts.writeScope,
+      verify: opts.verify,
+      json: !!opts.json,
+    });
+  });
+
+task
+  .command("status")
+  .description("list collaboration tasks")
+  .option("--root <path>", "collaboration root (default .siliconcode/collab)")
+  .option("--set <task=status>", "update one task status before printing")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts: { root?: string; set?: string; json?: boolean }) => {
+    const { taskStatusCommand } = await import("./commands/collab.js");
+    taskStatusCommand({ root: opts.root, set: opts.set, json: !!opts.json });
+  });
+
+task
+  .command("respond")
+  .description("send an approve/reject response to a worker")
+  .requiredOption("--task <id>", "task id")
+  .option("--to <agent>", "worker/agent to notify; defaults to task assignee")
+  .option("--from <agent>", "responding agent", "siliconcode")
+  .option("--request <id>", "permission request id")
+  .option("--note <text>", "response note")
+  .option("--approve", "approve the request")
+  .option("--reject", "reject the request")
+  .option("--root <path>", "collaboration root (default .siliconcode/collab)")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts) => {
+    const { taskRespondCommand } = await import("./commands/collab.js");
+    taskRespondCommand({
+      task: opts.task,
+      to: opts.to,
+      from: opts.from,
+      request: opts.request,
+      note: opts.note,
+      approve: !!opts.approve,
+      reject: !!opts.reject,
+      root: opts.root,
+      json: !!opts.json,
+    });
+  });
+
+// Register teams CLI
+{
+  const { registerTeamsCli } = await import("./commands/teams.js");
+  registerTeamsCli(program);
+}
+
+program
+  .command("replay <transcript>")
+  .description(t("cli.replay"))
+  .option("--print", t("ui.printHint"))
+  .option("--head <n>", t("ui.headHint"), parsePositiveIntegerOption)
+  .option("--tail <n>", t("ui.tailHint"), parsePositiveIntegerOption)
+  .action(async (transcript: string, opts) => {
+    const { replayCommand } = await import("./commands/replay.js");
+    await replayCommand({
+      path: transcript,
+      print: !!opts.print,
+      head: Number.isFinite(opts.head) ? opts.head : undefined,
+      tail: Number.isFinite(opts.tail) ? opts.tail : undefined,
+    });
+  });
+
+program
+  .command("diff <a> <b>")
+  .description(t("cli.diff"))
+  .option("--md <path>", t("ui.mdReportHint"))
+  .option("--print", t("ui.printHintTable"))
+  .option("--tui", t("ui.tuiHint"))
+  .option("--label-a <label>", t("ui.labelAHint"))
+  .option("--label-b <label>", t("ui.labelBHint"))
+  .action(async (a: string, b: string, opts) => {
+    const { diffCommand } = await import("./commands/diff.js");
+    await diffCommand({
+      a,
+      b,
+      mdPath: opts.md,
+      labelA: opts.labelA,
+      labelB: opts.labelB,
+      print: !!opts.print,
+      tui: !!opts.tui,
+    });
+  });
+
+const mcp = program.command("mcp").description(t("cli.mcp"));
+
+mcp
+  .command("list")
+  .description(t("ui.mcpListDescription"))
+  .option("--json", t("ui.jsonHintCatalog"))
+  .option("--local", t("ui.mcpLocalHint"))
+  .option("--refresh", t("ui.mcpRefreshHint"))
+  .option("--limit <n>", t("ui.mcpLimitHint"), parsePositiveIntegerOption)
+  .option("--pages <n>", t("ui.mcpPagesHint"), parsePositiveIntegerOption)
+  .option("--all", t("ui.mcpAllHint"))
+  .action(async (opts) => {
+    try {
+      const { mcpListCommand } = await import("./commands/mcp.js");
+      await mcpListCommand({
+        json: !!opts.json,
+        local: !!opts.local,
+        refresh: !!opts.refresh,
+        limit: typeof opts.limit === "number" && opts.limit > 0 ? opts.limit : undefined,
+        pages: typeof opts.pages === "number" && opts.pages > 0 ? opts.pages : undefined,
+        all: !!opts.all,
+      });
+    } catch (err) {
+      process.stderr.write(`mcp list failed: ${(err as Error).message}\n`);
+      process.exit(1);
+    }
+  });
+
+mcp
+  .command("search <query>")
+  .description(t("ui.mcpSearchDescription"))
+  .option("--json", t("ui.jsonHintCatalog"))
+  .option("--refresh", t("ui.mcpRefreshHint"))
+  .option("--limit <n>", t("ui.mcpLimitHint"), parsePositiveIntegerOption)
+  .option("--max-pages <n>", t("ui.mcpMaxPagesHint"), parsePositiveIntegerOption)
+  .action(async (query: string, opts) => {
+    try {
+      const { mcpSearchCommand } = await import("./commands/mcp.js");
+      await mcpSearchCommand(query, {
+        json: !!opts.json,
+        refresh: !!opts.refresh,
+        limit: typeof opts.limit === "number" && opts.limit > 0 ? opts.limit : undefined,
+        maxPages:
+          typeof opts.maxPages === "number" && opts.maxPages > 0 ? opts.maxPages : undefined,
+      });
+    } catch (err) {
+      process.stderr.write(`mcp search failed: ${(err as Error).message}\n`);
+      process.exit(1);
+    }
+  });
+
+mcp
+  .command("install <name>")
+  .description(t("ui.mcpInstallDescription"))
+  .option("--refresh", t("ui.mcpRefreshHint"))
+  .option("--max-pages <n>", t("ui.mcpMaxPagesHint"), parsePositiveIntegerOption)
+  .action(async (name: string, opts) => {
+    try {
+      const { mcpInstallCommand } = await import("./commands/mcp.js");
+      await mcpInstallCommand(name, {
+        refresh: !!opts.refresh,
+        maxPages:
+          typeof opts.maxPages === "number" && opts.maxPages > 0 ? opts.maxPages : undefined,
+      });
+    } catch (err) {
+      process.stderr.write(`mcp install failed: ${(err as Error).message}\n`);
+      process.exit(1);
+    }
+  });
+
+mcp
+  .command("browse")
+  .description(t("ui.mcpBrowseDescription"))
+  .action(async () => {
+    try {
+      const { mcpBrowseCommand } = await import("./commands/mcp-browse.js");
+      await mcpBrowseCommand();
+    } catch (err) {
+      process.stderr.write(`mcp browse failed: ${(err as Error).message}\n`);
+      process.exit(1);
+    }
+  });
+
+mcp
+  .command("inspect <spec>")
+  .description(t("ui.mcpInspectDescription"))
+  .option("--json", t("ui.jsonHintReport"))
+  .action(async (spec: string, opts) => {
+    const { formatMcpInspectFailure, mcpInspectCommand } = await import(
+      "./commands/mcp-inspect.js"
+    );
+    try {
+      await mcpInspectCommand({ spec, json: !!opts.json });
+    } catch (err) {
+      process.stderr.write(`mcp inspect failed: ${formatMcpInspectFailure(err)}\n`);
+      process.exit(1);
+    }
+  });
+
+const mwh = program.command("mwh").description("Middlewave Hub reusable middleware library");
+
+mwh
+  .command("mcp-server")
+  .description("run the Middlewave Hub stdio MCP server")
+  .option("--root <path>", "override system MWH root base for .siliconcode/mwh")
+  .option("--home <path>", "home root fallback for .siliconcode/mwh")
+  .action(async (opts: { root?: string; home?: string }) => {
+    const { runMwhMcpServer } = await import("./commands/mwh-mcp-server.js");
+    runMwhMcpServer({
+      projectRoot: opts.root,
+      homeDir: opts.home,
+    });
+  });
+
+program
+  .command("version")
+  .description(t("cli.version"))
+  .action(async () => {
+    const { versionCommand } = await import("./commands/version.js");
+    versionCommand();
+  });
+
+program
+  .command("update")
+  .description(t("cli.update"))
+  .option("--dry-run", t("ui.dryRunHint"))
+  .action(async (opts: { dryRun?: boolean }) => {
+    const { updateCommand } = await import("./commands/update.js");
+    await updateCommand({ dryRun: !!opts.dryRun });
+  });
+
+program
+  .command("index")
+  .description(t("cli.index"))
+  .option("--rebuild", t("ui.rebuildHint"))
+  .option("--model <name>", t("ui.embedModelHint"))
+  .option("--dir <path>", t("ui.projectDirHint"))
+  .option("--ollama-url <url>", t("ui.ollamaUrlHint"))
+  .option("-y, --yes", t("ui.skipPromptsHint"))
+  .action(
+    async (opts: {
+      rebuild?: boolean;
+      model?: string;
+      dir?: string;
+      ollamaUrl?: string;
+      yes?: boolean;
+    }) => {
+      const { indexCommand } = await import("./commands/index.js");
+      await indexCommand(opts);
+    },
+  );
+
+function collectOption(value: string, previous: string[] = []): string[] {
+  return [...previous, value];
+}
+
+program.parseAsync(process.argv).catch((err) => {
+  reportDiagnosticError({
+    severity: "fatal",
+    category: "process",
+    component: "cli",
+    errorCode: "CLI_COMMAND_FAILED",
+    error: err,
+  });
+  console.error(err);
+  void flushDiagnostics(1_500).finally(() => process.exit(1));
+});

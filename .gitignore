@@ -1,0 +1,64 @@
+node_modules/
+dist/
+coverage/
+.stryker-tmp/
+.env
+.env.local
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.tsbuildinfo
+transcripts/
+sessions/
+*.jsonl
+!tests/**/*.jsonl
+# Committed reference transcripts so readers can run brown replay / diff
+# the v0.1 bench results without an API key.
+!benchmarks/tau-bench/transcripts/
+!benchmarks/tau-bench/transcripts/*.jsonl
+.turbo/
+# Local-only Claude Code settings — personal overrides, never committed.
+.claude/settings.local.json
+# Per-user Silicon Code state under .siliconcode/ - committable team-level
+# files (settings.json, skills/) stay tracked, but the user-private
+# bits (semantic index, sessions, opt-out markers) never should.
+.siliconcode/semantic/
+.siliconcode/sessions/
+.siliconcode/semantic-skip
+
+# Legacy Reasonix private state.
+.reasonix/semantic/
+.reasonix/sessions/
+.reasonix/semantic-skip
+# Scratch entry regenerated each time scripts/bundle-codemirror.mjs runs.
+scripts/.cm-entry.mjs
+# Personal bun lockfile — project uses npm officially.
+bun.lock
+
+# Local portable Node/npm used for development on machines without npm.
+.tools/
+.npm-cache/
+
+# Tauri desktop shell build artifacts.
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/src-tauri/binaries/
+
+# Desktop app source now lives in https://github.com/BrownSweet/siliconcode_app.
+/desktop/
+/.github/workflows/desktop.yml
+/tests/desktop-*.test.ts
+/tests/installer-nsh-no-placeholders.test.ts
+
+# Design mock-up reference (local, not part of repo)
+.design-ref/
+*.cpuprofile
+
+# Playwright MCP scratch output (page snapshots / screenshots).
+.playwright-mcp/

@@ -1,0 +1,507 @@
+import { cleanupInterruptedCards } from "../interrupt-cleanup.js";
+import type {
+  Card,
+  CardId,
+  LiveCard,
+  ReasoningCard,
+  StreamingCard,
+  ToolCard,
+  UserCard,
+} from "./cards.js";
+import type { AgentEvent } from "./events.js";
+import type { AgentState, Toast } from "./state.js";
+
+export function reduce(state: AgentState, event: AgentEvent): AgentState {
+  switch (event.type) {
+    case "user.submit":
+      return appendCard(state, makeUserCard(event.text));
+
+    case "turn.start":
+      return { ...state, turnInProgress: true };
+
+    case "turn.thinking":
+      return appendCard(
+        state,
+        makeLiveCard("thinking", `thinking · ${state.session.model}`, "brand"),
+      );
+
+    case "reasoning.start":
+      return appendCard(state, makeReasoningCard(event.id, event.model ?? state.session.model));
+
+    case "reasoning.chunk":
+      return mutateCard(state, event.id, "reasoning", (c) => ({ ...c, text: c.text + event.text }));
+
+    case "reasoning.end":
+      return mutateCard(state, event.id, "reasoning", (c) => ({
+        ...c,
+        paragraphs: event.paragraphs,
+        tokens: event.tokens,
+        streaming: false,
+        endedAt: Date.now(),
+        ...(event.aborted ? { aborted: true } : {}),
+      }));
+
+    case "streaming.start":
+      return appendCard(
+        state,
+        makeStreamingCard(event.id, event.model ?? state.session.model, event.userPrompt),
+      );
+
+    case "streaming.chunk":
+      return mutateCard(state, event.id, "streaming", (c) => ({ ...c, text: c.text + event.text }));
+
+    case "streaming.end":
+      return mutateCard(state, event.id, "streaming", (c) => ({
+        ...c,
+        done: true,
+        endedAt: Date.now(),
+        ...(event.aborted ? { aborted: true } : {}),
+      }));
+
+    case "tool.start":
+      return appendCard(state, makeToolCard(event.id, event.name, event.args));
+
+    case "tool.chunk":
+      return mutateCard(state, event.id, "tool", (c) => ({ ...c, output: c.output + event.text }));
+
+    case "tool.end": {
+      const finalOutput = event.output ?? "";
+      const rejected = isPlanModeRejection(finalOutput);
+      const exitCode = event.exitCode ?? inferToolExitCode(finalOutput);
+      return mutateCard(state, event.id, "tool", (c) => ({
+        ...c,
+        done: true,
+        output: event.output ?? c.output,
+        exitCode,
+        elapsedMs: event.elapsedMs,
+        ...(event.aborted ? { aborted: true } : {}),
+        ...(rejected ? { rejected: true } : {}),
+      }));
+    }
+
+    case "tool.retry":
+      return mutateCard(state, event.id, "tool", (c) => ({
+        ...c,
+        retry: { attempt: event.attempt, max: event.max },
+      }));
+
+    case "turn.abort":
+      return {
+        ...state,
+        turnInProgress: false,
+        composer: { ...state.composer, abortedHint: true },
+      };
+
+    case "turn.interrupt.cleanup":
+      return appendCard(
+        {
+          ...state,
+          cards: cleanupInterruptedCards(state.cards, event.ts) as Card[],
+          turnInProgress: false,
+          composer: { ...state.composer, abortedHint: true },
+        },
+        {
+          kind: "live",
+          id: event.id,
+          ts: event.ts,
+          variant: "aborted",
+          tone: "warn",
+          text: event.text,
+        },
+      );
+
+    case "turn.end": {
+      const sessionCost = state.status.sessionCost + event.usage.cost;
+      const sessionInputTokens = state.status.sessionInputTokens + event.usage.prompt;
+      const sessionOutputTokens = state.status.sessionOutputTokens + event.usage.output;
+      return {
+        ...state,
+        turnInProgress: false,
+        status: {
+          ...state.status,
+          cost: event.usage.cost,
+          sessionCost,
+          cacheHit: event.sessionCacheHit ?? event.usage.cacheHit,
+          promptTokens: event.usage.prompt,
+          promptCap: event.promptCap ?? state.status.promptCap,
+          sessionInputTokens,
+          sessionOutputTokens,
+          lastTurnMs: event.elapsedMs ?? state.status.lastTurnMs,
+        },
+      };
+    }
+
+    case "mode.change":
+      return { ...state, status: { ...state.status, mode: event.mode } };
+
+    case "network.change":
+      return {
+        ...state,
+        status: { ...state.status, network: event.state, networkDetail: event.detail },
+      };
+
+    case "language.change":
+      return { ...state, lang: event.lang as any };
+
+    case "session.update":
+      return { ...state, status: { ...state.status, ...event.patch } };
+
+    case "session.model.change":
+      return state.session.model === event.model
+        ? state
+        : { ...state, session: { ...state.session, model: event.model } };
+
+    case "session.preset.change":
+      return state.status.preset === event.preset
+        ? state
+        : { ...state, status: { ...state.status, preset: event.preset } };
+
+    case "mcp.loading": {
+      const current = state.status.mcpLoading;
+      if (event.total <= 0) {
+        if (!current) return state;
+        const { mcpLoading: _drop, ...rest } = state.status;
+        return { ...state, status: rest };
+      }
+      if (current && current.ready === event.ready && current.total === event.total) return state;
+      return {
+        ...state,
+        status: { ...state.status, mcpLoading: { ready: event.ready, total: event.total } },
+      };
+    }
+
+    case "focus.move":
+      return {
+        ...state,
+        focusedCardId: moveFocus(state.cards, state.focusedCardId, event.direction),
+      };
+
+    case "focus.set":
+      return { ...state, focusedCardId: event.cardId };
+
+    case "card.toggle":
+      return state;
+
+    case "composer.input":
+      return {
+        ...state,
+        composer: {
+          ...state.composer,
+          value: event.value,
+          cursor: event.value.length,
+          abortedHint: false,
+        },
+      };
+
+    case "composer.cursor":
+      return { ...state, composer: { ...state.composer, cursor: event.index } };
+
+    case "composer.history":
+      return state;
+
+    case "picker.open":
+      return { ...state, composer: { ...state.composer, picker: event.kind } };
+
+    case "picker.close":
+      return { ...state, composer: { ...state.composer, picker: null } };
+
+    case "toast.show":
+      return { ...state, toasts: [...state.toasts, makeToast(event)] };
+
+    case "toast.hide":
+      return { ...state, toasts: state.toasts.filter((t) => t.id !== event.id) };
+
+    case "live.show":
+      return appendCard(state, {
+        kind: "live",
+        id: event.id,
+        ts: event.ts,
+        variant: event.variant,
+        tone: event.tone,
+        text: event.text,
+        meta: event.meta,
+      });
+
+    case "tip.show":
+      return appendCard(state, {
+        kind: "tip",
+        id: event.id,
+        ts: event.ts,
+        topic: event.topic,
+        sections: event.sections,
+        footer: event.footer,
+        oneTime: event.oneTime,
+      });
+
+    case "session.reset":
+      return {
+        ...state,
+        cards: [],
+        focusedCardId: null,
+        toasts: [],
+        status: {
+          ...state.status,
+          cost: 0,
+          sessionCost: 0,
+          cacheHit: 0,
+          promptTokens: undefined,
+          promptCap: undefined,
+        },
+      };
+
+    case "session.workspace.change":
+      return state.session.id === event.id && state.session.workspace === event.workspace
+        ? state
+        : {
+            ...state,
+            session: { ...state.session, id: event.id, workspace: event.workspace },
+          };
+
+    case "plan.show":
+      return appendCard(state, {
+        kind: "plan",
+        id: event.id,
+        ts: Date.now(),
+        title: event.title,
+        steps: event.steps,
+        variant: event.variant,
+      });
+
+    case "plan.drop": {
+      // Latest still-active plan flips to "replay" — preserves it in scrollback
+      // but signals "no longer the live plan" to selectors and UI.
+      let dropped = false;
+      const cards = state.cards.map((c, i) => {
+        if (dropped) return c;
+        if (c.kind !== "plan" || c.variant !== "active") return c;
+        // Walk from end — only the LAST active plan should drop.
+        if (state.cards.slice(i + 1).some((cc) => cc.kind === "plan" && cc.variant === "active")) {
+          return c;
+        }
+        dropped = true;
+        return { ...c, variant: "replay" as const };
+      });
+      return dropped ? { ...state, cards } : state;
+    }
+
+    case "plan.step.complete": {
+      let changed = false;
+      const cards = state.cards.map((c) => {
+        if (c.kind !== "plan") return c;
+        let stepChanged = false;
+        const next = c.steps.map((s) => {
+          if (s.id !== event.stepId || s.status === "done") return s;
+          stepChanged = true;
+          return { ...s, status: "done" as const };
+        });
+        if (!stepChanged) return c;
+        changed = true;
+        return { ...c, steps: next };
+      });
+      return changed ? { ...state, cards } : state;
+    }
+
+    case "ctx.show":
+      return appendCard(state, {
+        kind: "ctx",
+        id: event.id,
+        ts: Date.now(),
+        text: event.text,
+        systemTokens: event.systemTokens,
+        toolsTokens: event.toolsTokens,
+        logTokens: event.logTokens,
+        inputTokens: event.inputTokens,
+        ctxMax: event.ctxMax,
+        toolsCount: event.toolsCount,
+        logMessages: event.logMessages,
+        topTools: event.topTools,
+      });
+
+    case "doctor.show":
+      return appendCard(state, {
+        kind: "doctor",
+        id: event.id,
+        ts: Date.now(),
+        checks: event.checks,
+      });
+
+    case "usage.show":
+      return appendCard(state, {
+        kind: "usage",
+        id: event.id,
+        ts: Date.now(),
+        turn: event.turn,
+        tokens: event.tokens,
+        cacheHit: event.cacheHit,
+        cost: event.cost,
+        sessionCost: event.sessionCost,
+        balance: event.balance,
+        balanceCurrency: event.balanceCurrency,
+        elapsedMs: event.elapsedMs,
+      });
+  }
+}
+
+/** Tool outputs older than this many cards get stubbed so a 7-hour session doesn't drag GBs of one-off file reads / search results / screenshots through the heap (issue #1031). */
+const RECENT_CARDS_WINDOW = 200;
+/** Don't bother eliding tiny outputs — the stub is itself ~150 chars and the savings aren't worth the lost context. */
+const MIN_ELIDE_OUTPUT_LENGTH = 4096;
+/** Marker for already-elided outputs so we don't re-stub on every subsequent append. */
+const ELIDED_TOOL_OUTPUT_PREFIX = "[elided — older than the last ";
+
+function elideOldToolOutputs(cards: ReadonlyArray<Card>): ReadonlyArray<Card> {
+  // Caller is about to append a new card. Anticipate that — so once
+  // cards.length hits the window, the very next append starts eliding.
+  if (cards.length < RECENT_CARDS_WINDOW) return cards;
+  const cutoff = cards.length + 1 - RECENT_CARDS_WINDOW;
+  let next: Card[] | null = null;
+  for (let i = 0; i < cutoff; i++) {
+    const c = cards[i]!;
+    if (c.kind !== "tool") continue;
+    const out = (c as ToolCard).output;
+    if (typeof out !== "string") continue;
+    if (out.length <= MIN_ELIDE_OUTPUT_LENGTH) continue;
+    if (out.startsWith(ELIDED_TOOL_OUTPUT_PREFIX)) continue;
+    if (next === null) next = cards.slice();
+    next[i] = {
+      ...(c as ToolCard),
+      output: `${ELIDED_TOOL_OUTPUT_PREFIX}${RECENT_CARDS_WINDOW} cards; ${out.length.toLocaleString()} chars dropped to save memory. Full output is on disk in the session log.]`,
+    };
+  }
+  return next ?? cards;
+}
+
+function appendCard(state: AgentState, card: Card): AgentState {
+  return { ...state, cards: [...elideOldToolOutputs(state.cards), card] };
+}
+
+function mutateCard<K extends Card["kind"]>(
+  state: AgentState,
+  id: CardId,
+  kind: K,
+  patch: (card: Extract<Card, { kind: K }>) => Extract<Card, { kind: K }>,
+): AgentState {
+  const idx = state.cards.findIndex((c) => c.id === id && c.kind === kind);
+  if (idx < 0) return state;
+  const next = state.cards.slice();
+  next[idx] = patch(state.cards[idx] as Extract<Card, { kind: K }>);
+  return { ...state, cards: next };
+}
+
+function moveFocus(
+  cards: ReadonlyArray<Card>,
+  current: CardId | null,
+  dir: "next" | "prev" | "first" | "last",
+): CardId | null {
+  const last = cards.length - 1;
+  if (last < 0) return null;
+  if (dir === "first") return cards[0]!.id;
+  if (dir === "last") return cards[last]!.id;
+  const idx = current ? cards.findIndex((c) => c.id === current) : -1;
+  if (idx < 0) return cards[last]!.id;
+  const next = dir === "next" ? Math.min(idx + 1, last) : Math.max(idx - 1, 0);
+  return cards[next]!.id;
+}
+
+let toastSeq = 0;
+function makeToast(event: Extract<AgentEvent, { type: "toast.show" }>): Toast {
+  toastSeq += 1;
+  return {
+    id: `toast-${toastSeq}`,
+    tone: event.tone,
+    title: event.title,
+    detail: event.detail,
+    bornAt: Date.now(),
+    ttlMs: event.ttlMs,
+  };
+}
+
+let cardSeq = 0;
+function nextId(prefix: string): string {
+  cardSeq += 1;
+  return `${prefix}-${cardSeq}`;
+}
+
+function makeUserCard(text: string): UserCard {
+  return { kind: "user", id: nextId("user"), ts: Date.now(), text };
+}
+
+function makeReasoningCard(id: string, model?: string): ReasoningCard {
+  return {
+    kind: "reasoning",
+    id,
+    ts: Date.now(),
+    text: "",
+    paragraphs: 0,
+    tokens: 0,
+    streaming: true,
+    ...(model ? { model } : {}),
+  };
+}
+
+function makeStreamingCard(id: string, model?: string, userPrompt?: string): StreamingCard {
+  return {
+    kind: "streaming",
+    id,
+    ts: Date.now(),
+    text: "",
+    done: false,
+    ...(model ? { model } : {}),
+    ...(userPrompt ? { userPrompt } : {}),
+  };
+}
+
+function makeToolCard(id: string, name: string, args: unknown): ToolCard {
+  return {
+    kind: "tool",
+    id,
+    ts: Date.now(),
+    name,
+    args,
+    output: "",
+    done: false,
+    elapsedMs: 0,
+  };
+}
+
+function makeLiveCard(
+  variant: LiveCard["variant"],
+  text: string,
+  tone: LiveCard["tone"],
+): LiveCard {
+  return { kind: "live", id: nextId("live"), ts: Date.now(), variant, text, tone };
+}
+
+/** Detect the plan-mode bounce marker emitted by ToolRegistry.dispatch when refusing a write tool. */
+function isPlanModeRejection(output: string): boolean {
+  if (!output) return false;
+  try {
+    const parsed = JSON.parse(output);
+    return parsed?.rejectedReason === "plan-mode";
+  } catch {
+    return false;
+  }
+}
+
+function inferToolExitCode(output: string): number | undefined {
+  if (!output) return undefined;
+  try {
+    const parsed = JSON.parse(output.trim()) as unknown;
+    if (!parsed || typeof parsed !== "object") return undefined;
+    const error = (parsed as Record<string, unknown>).error;
+    if (typeof error !== "string") return undefined;
+    return isControlSignalError(error) ? undefined : 1;
+  } catch {
+    return undefined;
+  }
+}
+
+function isControlSignalError(error: string): boolean {
+  const tag = error.split(":", 1)[0]?.trim();
+  return (
+    tag === "PlanProposedError" ||
+    tag === "PlanRevisionProposedError" ||
+    tag === "ChoiceRequestedError" ||
+    tag === "NeedsConfirmationError"
+  );
+}
