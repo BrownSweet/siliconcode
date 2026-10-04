@@ -12,6 +12,7 @@ import {
 } from "../src/cli/ui/slash.js";
 import { DeepSeekClient, Usage } from "../src/client.js";
 import { loadTheme } from "../src/config.js";
+import * as configModule from "../src/config.js";
 import {
   getLanguage,
   notifyLanguageChange,
@@ -145,7 +146,7 @@ describe("handleSlash", () => {
   it("/model migrates retired aliases while preserving thinking semantics", () => {
     const loop = makeLoop();
     handleSlash("model", ["deepseek-reasoner"], loop);
-    expect(loop.model).toBe("deepseek-v4-flash");
+    expect(loop.model).toBe("deepseek-flash");
     expect(loop.thinkingMode).toBe("enabled");
   });
 
@@ -223,7 +224,7 @@ describe("handleSlash", () => {
     const loop = makeLoop();
     handleSlash("model", ["deepseek-v4-pro"], loop);
     handleSlash("preset", ["auto"], loop);
-    expect(loop.model).toBe("deepseek-v4-flash");
+    expect(loop.model).toBe("deepseek-flash");
     expect(loop.reasoningEffort).toBe("max");
     expect(loop.autoEscalate).toBe(true);
   });
@@ -231,7 +232,7 @@ describe("handleSlash", () => {
   it("/preset flash = v4-flash, no auto-escalate", () => {
     const loop = makeLoop();
     handleSlash("preset", ["flash"], loop);
-    expect(loop.model).toBe("deepseek-v4-flash");
+    expect(loop.model).toBe("deepseek-flash");
     expect(loop.reasoningEffort).toBe("max");
     expect(loop.autoEscalate).toBe(false);
   });
@@ -252,7 +253,7 @@ describe("handleSlash", () => {
   it("/thinking controls V4 thinking independently from the model", () => {
     const loop = makeLoop();
     handleSlash("thinking", ["off"], loop);
-    expect(loop.model).toBe("deepseek-v4-flash");
+    expect(loop.model).toBe("deepseek-flash");
     expect(loop.thinkingMode).toBe("disabled");
 
     const status = handleSlash("thinking", [], loop);
@@ -1359,7 +1360,19 @@ describe("handleSlash", () => {
   });
 
   describe("/language", () => {
+    let tempDir: string;
+    let restoreSave: (() => void) | undefined;
+    beforeEach(() => {
+      tempDir = mkdtempSync(join(tmpdir(), "siliconcode-slash-language-"));
+      const save = configModule.saveLanguage;
+      const spy = vi
+        .spyOn(configModule, "saveLanguage")
+        .mockImplementation((lang) => save(lang, join(tempDir, "config.json")));
+      restoreSave = () => spy.mockRestore();
+    });
     afterEach(() => {
+      restoreSave?.();
+      rmSync(tempDir, { recursive: true, force: true });
       setLanguageRuntime("EN");
     });
 

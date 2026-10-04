@@ -23,26 +23,40 @@ export interface ModelCapabilities {
   };
 }
 
-export const FLASH_MODEL_ID = "deepseek-v4-flash";
+export const FLASH_MODEL_ID = "deepseek-flash";
 export const PRO_MODEL_ID = "deepseek-v4-pro";
 export const SUMMARY_MODEL_ID = FLASH_MODEL_ID;
 export const ESCALATION_MODEL_ID = PRO_MODEL_ID;
 export const DEFAULT_CONTEXT_TOKENS = 131_072;
 export const DEEPSEEK_MAX_TOOLS = 128;
 
+// Conservative peak-rate estimate, verified 2026-10-03 against
+// https://api-docs.deepseek.com/quick_start/pricing/ . Actual billing may be lower
+// off peak; we do not guess Chinese public holidays in a cost/budget guard.
 const FLASH_PRICING: ModelPricing = {
-  inputCacheHit: 0.0028,
-  inputCacheMiss: 0.14,
-  output: 0.28,
+  inputCacheHit: 0.006,
+  inputCacheMiss: 0.3,
+  output: 1.2,
 };
 
 const PRO_PRICING: ModelPricing = {
-  inputCacheHit: 0.003625,
-  inputCacheMiss: 0.435,
-  output: 0.87,
+  inputCacheHit: 0.044,
+  inputCacheMiss: 1.32,
+  output: 3.96,
 };
 
 export const MODEL_CAPABILITIES: Readonly<Record<string, ModelCapabilities>> = {
+  "deepseek-v4-flash": {
+    id: "deepseek-v4-flash",
+    contextTokens: 1_000_000,
+    maxOutputTokens: 384_000,
+    pricing: FLASH_PRICING,
+    defaultThinking: "enabled",
+    supportsThinkingToggle: true,
+    reasoningEfforts: ["high", "max"],
+    // Existing model pins remain callable aliases with current Flash limits/pricing.
+    selectable: false,
+  },
   [FLASH_MODEL_ID]: {
     id: FLASH_MODEL_ID,
     contextTokens: 1_000_000,

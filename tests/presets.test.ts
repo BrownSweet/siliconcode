@@ -3,7 +3,7 @@ import { PRESETS, canonicalPresetName, resolvePreset } from "../src/cli/ui/prese
 
 describe("resolvePreset", () => {
   it("resolves built-in presets by canonical name", () => {
-    expect(resolvePreset("auto").model).toBe("deepseek-v4-flash");
+    expect(resolvePreset("auto").model).toBe("deepseek-flash");
     expect(resolvePreset("flash").autoEscalate).toBe(false);
     expect(resolvePreset("pro").reasoningEffort).toBe("max");
   });

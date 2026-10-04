@@ -7,10 +7,11 @@ import { initLangFromServer, t, useLang } from "./src/i18n";
 import { MODE, api } from "./src/lib/api";
 import { ToastStack, appBus } from "./src/lib/bus";
 import { ErrorBoundary, ErrorOverlay } from "./src/lib/error-boundary";
-import { usePoll } from "./src/lib/use-poll";
 import { readDashboardStorage, writeDashboardStorage } from "./src/lib/storage";
+import { usePoll } from "./src/lib/use-poll";
 import { ChangesPanel } from "./src/panels/changes";
 import { ChatPanel } from "./src/panels/chat";
+import { DeliveryPanel } from "./src/panels/delivery";
 import { HooksPanel } from "./src/panels/hooks";
 import { McpPanel } from "./src/panels/mcp";
 import { MemoryPanel } from "./src/panels/memory";
@@ -56,6 +57,12 @@ function tabSections() {
       tabs: [
         { id: "chat", name: t("app.tabChat"), glyph: "◆", panel: () => html`<${ChatPanel} />` },
         { id: "plans", name: t("app.tabPlans"), glyph: "⊞", panel: () => html`<${PlansPanel} />` },
+        {
+          id: "delivery",
+          name: t("app.tabDelivery"),
+          glyph: "↻",
+          panel: () => html`<${DeliveryPanel} />`,
+        },
         {
           id: "sessions",
           name: t("app.tabSessions"),

@@ -39,16 +39,16 @@ function escapeAttr(s: string): string {
 }
 
 function lineDiff(a: string[], b: string[]): DE[] {
-  const m = a.length,
-    n = b.length;
+  const m = a.length;
+  const n = b.length;
   const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
   for (let i = 1; i <= m; i++)
     for (let j = 1; j <= n; j++)
       dp[i]![j] =
         a[i - 1] === b[j - 1] ? dp[i - 1]![j - 1]! + 1 : Math.max(dp[i - 1]![j]!, dp[i]![j - 1]!);
   const out: DE[] = [];
-  let i = m,
-    j = n;
+  let i = m;
+  let j = n;
   while (i > 0 || j > 0) {
     if (i > 0 && j > 0 && a[i - 1] === b[j - 1]) {
       out.push({ kind: "context", text: a[i - 1]! });
@@ -75,10 +75,10 @@ function pairDiffRows(diff: DE[]): DP[] {
       k++;
       continue;
     }
-    const d: string[] = [],
-      ins: string[] = [];
-    while (k < diff.length && diff[k]!.kind === "del") d.push(diff[k]!.text), k++;
-    while (k < diff.length && diff[k]!.kind === "ins") ins.push(diff[k]!.text), k++;
+    const d: string[] = [];
+    const ins: string[] = [];
+    while (k < diff.length && diff[k]!.kind === "del") { d.push(diff[k]!.text); k++; }
+    while (k < diff.length && diff[k]!.kind === "ins") { ins.push(diff[k]!.text); k++; }
     const p = Math.max(d.length, ins.length);
     for (let i = 0; i < p; i++)
       rows.push({
@@ -110,8 +110,8 @@ function renderDiffHtml(patch: string, style: "unified" | "split"): string {
     return html;
   }
   // Split
-  const oldLines: string[] = [],
-    newLines: string[] = [];
+  const oldLines: string[] = [];
+  const newLines: string[] = [];
   for (const hunk of hunks) {
     for (const line of hunk.lines) {
       if (line.type === "ctx") {
@@ -123,8 +123,8 @@ function renderDiffHtml(patch: string, style: "unified" | "split"): string {
   }
   const diff = lineDiff(oldLines, newLines);
   const rows = pairDiffRows(diff);
-  let oldNum = 1,
-    newNum = 1;
+  let oldNum = 1;
+  let newNum = 1;
   let html = `<div class="edit-diff-head"><div class="edit-diff-side edit-diff-side-old"><span class="edit-diff-marker">−</span> Before</div><div class="edit-diff-side edit-diff-side-new"><span class="edit-diff-marker">+</span> After</div></div><div class="edit-diff-body">`;
   for (const row of rows) {
     html += `<div class="edit-diff-row edit-diff-row-${row.kind}">`;
@@ -133,15 +133,15 @@ function renderDiffHtml(patch: string, style: "unified" | "split"): string {
       html += `<span class="edit-diff-ln">${oldNum}</span><span class="edit-diff-marker">${row.kind === "del" || row.kind === "change" ? "−" : " "}</span>${hE(row.left)}`;
       oldNum++;
     }
-    html += `</div>`;
+    html += "</div>";
     html += `<div class="edit-diff-cell edit-diff-cell-new">`;
     if (row.right != null) {
       html += `<span class="edit-diff-ln">${newNum}</span><span class="edit-diff-marker">${row.kind === "ins" || row.kind === "change" ? "+" : " "}</span>${hE(row.right)}`;
       newNum++;
     }
-    html += `</div></div>`;
+    html += "</div></div>";
   }
-  html += `</div>`;
+  html += "</div>";
   return html;
 }
 
@@ -239,24 +239,24 @@ export function ChangesPanel() {
         })
         .join(""),
     );
-  }, [diffs, diffStyle, t]);
+  }, [diffs, diffStyle]);
 
   // Expand / collapse all
   const expandAll = useCallback(() => {
-    document.querySelectorAll(".review-file-body").forEach((el) => {
+    for (const el of document.querySelectorAll(".review-file-body")) {
       (el as HTMLElement).style.display = "";
-    });
-    document.querySelectorAll(".review-file-header .chev").forEach((el) => {
+    }
+    for (const el of document.querySelectorAll(".review-file-header .chev")) {
       el.textContent = "▾";
-    });
+    }
   }, []);
   const collapseAll = useCallback(() => {
-    document.querySelectorAll(".review-file-body").forEach((el) => {
+    for (const el of document.querySelectorAll(".review-file-body")) {
       (el as HTMLElement).style.display = "none";
-    });
-    document.querySelectorAll(".review-file-header .chev").forEach((el) => {
+    }
+    for (const el of document.querySelectorAll(".review-file-header .chev")) {
       el.textContent = "▸";
-    });
+    }
   }, []);
 
   const handleLeftResize = useCallback((delta: number) => {
@@ -1060,8 +1060,8 @@ function TabBar(props: TabBarProps) {
           row.textContent = f;
           row.style.cssText =
             "padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:var(--font-mono);border-radius:3px";
-          row.onmouseenter = () => (row.style.background = "var(--bg-hover)");
-          row.onmouseleave = () => (row.style.background = "transparent");
+          row.onmouseenter = () => { row.style.background = "var(--bg-hover)"; };
+          row.onmouseleave = () => { row.style.background = "transparent"; };
           row.onclick = (ev) => {
             ev.stopPropagation();
             onOpenFile?.(f);
@@ -1173,6 +1173,8 @@ function CodeViewer(props: CodeViewerProps) {
   } = props;
   const codeRef = useRef<HTMLDivElement>(null);
   const [hoveredLine, setHoveredLine] = useState<number | null>(null);
+  const hoveredLineRef = useRef(hoveredLine);
+  hoveredLineRef.current = hoveredLine;
 
   useEffect(() => {
     if (!file) return;
@@ -1181,11 +1183,11 @@ function CodeViewer(props: CodeViewerProps) {
     el.innerHTML = "";
     const lines = file.content.split("\n");
     const commentsByLine = new Map<number, LineComment[]>();
-    comments.forEach((c) => {
+    for (const c of comments) {
       const existing = commentsByLine.get(c.lineNumber) || [];
       existing.push(c);
       commentsByLine.set(c.lineNumber, existing);
-    });
+    }
 
     lines.forEach((line, i) => {
       const lineNumber = i + 1;
@@ -1209,7 +1211,7 @@ function CodeViewer(props: CodeViewerProps) {
 
       if (onStartComment) {
         const isVisible =
-          hoveredLine === lineNumber &&
+          hoveredLineRef.current === lineNumber &&
           (!draft || draft.file !== file.path || draft.lineNumber !== lineNumber);
         const anchorBtn = document.createElement("span");
         anchorBtn.className = `line-comment-anchor ${isVisible ? "visible" : ""}`;
@@ -1304,10 +1306,10 @@ function CodeViewer(props: CodeViewerProps) {
       }
 
       if (hasComments) {
-        lineComments.forEach((comment) => {
-          if (el.querySelector(`.line-comment-bubble[data-id="${comment.id}"]`)) return;
+        for (const comment of lineComments) {
+          if (el.querySelector(`.line-comment-bubble[data-id="${comment.id}"]`)) continue;
           const isEditing = draft && draft.editingId === comment.id;
-          if (isEditing) return;
+          if (isEditing) continue;
           const bubbleDiv = document.createElement("div");
           bubbleDiv.className = "line-comment-bubble";
           bubbleDiv.dataset.id = comment.id;
@@ -1352,14 +1354,14 @@ function CodeViewer(props: CodeViewerProps) {
           bubbleDiv.appendChild(contentDiv);
           bubbleDiv.appendChild(footerDiv);
           el.appendChild(bubbleDiv);
-        });
+        }
       }
     });
 
     if (hljs) {
       const codeEl = codeRef.current;
       if (codeEl) {
-        codeEl.querySelectorAll(".ln-content").forEach((span) => {
+        for (const span of codeEl.querySelectorAll(".ln-content")) {
           const text = span.textContent ?? "";
           try {
             const result = hljs.highlight(text, { language: file.language, ignoreIllegals: true });
@@ -1367,24 +1369,24 @@ function CodeViewer(props: CodeViewerProps) {
           } catch {
             span.textContent = text;
           }
-        });
+        }
       }
     }
-  }, [file, comments, draft]);
+  }, [file, comments, draft, onStartComment, onEditComment, onCancelComment, onCommentChange, onSubmitComment, onDeleteComment]);
 
   useEffect(() => {
     if (!codeRef.current || !file) return;
     const anchors = codeRef.current.querySelectorAll<HTMLElement>(".line-comment-anchor");
-    anchors.forEach((anchor) => {
+    for (const anchor of anchors) {
       const lineDiv = anchor.closest(".editor-line") as HTMLElement;
-      if (!lineDiv) return;
+      if (!lineDiv) continue;
       const lineNumber = Number.parseInt(lineDiv.dataset.lineNumber || "0", 10);
       const isVisible =
         hoveredLine === lineNumber &&
         (!draft || draft.file !== file.path || draft.lineNumber !== lineNumber);
       anchor.style.opacity = isVisible ? "1" : "0";
       anchor.style.pointerEvents = isVisible ? "auto" : "none";
-    });
+    }
   }, [hoveredLine, draft, file]);
 
   if (!file) {
@@ -1689,8 +1691,9 @@ function ChatPane(props: ChatPaneProps) {
       es.close();
       cancelStreamingRaf();
     };
-  }, [refetchCanonicalState, cancelStreamingRaf]);
+  }, [refetchCanonicalState, cancelStreamingRaf, flushStreaming]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Content changes trigger scrolling through the DOM ref.
   useEffect(() => {
     if (!shouldAutoScroll.current) return;
     const el = feedRef.current;
@@ -1743,7 +1746,7 @@ function ChatPane(props: ChatPaneProps) {
     setInput(item.insert);
     setPopoverKind(null);
     return true;
-  }, [popoverItems, popoverSel, popoverKind, input]);
+  }, [popoverItems, popoverSel]);
 
   const onInput = useCallback(
     (e: Event) => {
@@ -1779,11 +1782,11 @@ function ChatPane(props: ChatPaneProps) {
         return;
       }
       setInput("");
-      props.comments.forEach((c) => props.deleteComment(c.id));
+      for (const c of props.comments) props.deleteComment(c.id);
     } catch (err) {
       setError((err as Error).message);
     }
-  }, [input, busy, props.comments]);
+  }, [input, busy, props.comments, props.deleteComment]);
 
   const abort = useCallback(async () => {
     try {
@@ -1879,7 +1882,7 @@ function ChatPane(props: ChatPaneProps) {
         send();
       }
     },
-    [send, abort, busy, popoverKind, popoverItems, applyPopover],
+    [send, popoverKind, popoverItems, applyPopover],
   );
 
   const allMessages = streaming

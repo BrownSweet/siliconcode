@@ -53,7 +53,7 @@ export function useLineComments() {
   }, []);
 
   const submitDraft = useCallback(() => {
-    if (draft && draft.content.trim()) {
+    if (draft?.content.trim()) {
       if (draft.editingId) {
         updateComment(draft.editingId, draft.content.trim());
       } else {

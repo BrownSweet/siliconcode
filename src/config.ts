@@ -13,7 +13,13 @@ import {
 } from "./index/config.js";
 import { type McpServerSpec, parseMcpSpec } from "./mcp/spec.js";
 import type { McpToolProfile } from "./mcp/tool-profile.js";
-import { type ThinkingPreference, migrateRetiredModel } from "./models.js";
+import {
+  FLASH_MODEL_ID,
+  PRO_MODEL_ID,
+  type ThinkingPreference,
+  migrateRetiredModel,
+  modelCapabilities,
+} from "./models.js";
 import { normalizeQQAllowlist, normalizeQQOpenId } from "./qq/access.js";
 
 /** Legacy `fast|smart|max` kept for back-compat with existing config.json files. */
@@ -583,14 +589,7 @@ function inferLegacyModelProviderKind(
   const baseUrl = env.DEEPSEEK_BASE_URL?.trim() || cfg.baseUrl;
   if (!isOfficialDeepSeekBaseUrl(baseUrl)) return "custom";
   const model = cfg.model?.trim();
-  if (
-    model &&
-    !new Set(["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]).has(
-      model,
-    )
-  ) {
-    return "custom";
-  }
+  if (model && !modelCapabilities(model)) return "custom";
   return "deepseek";
 }
 
@@ -624,7 +623,7 @@ function normalizeModelProvider(value: unknown): ModelProviderConfig | null {
     if (models.length) provider.models = models;
   }
   if (kind === "deepseek" && !provider.models?.length) {
-    provider.models = ["deepseek-v4-flash", "deepseek-v4-pro"];
+    provider.models = [FLASH_MODEL_ID, PRO_MODEL_ID];
   }
   if (typeof value.preset === "string") provider.preset = value.preset as PresetName;
   if (
@@ -728,6 +727,33 @@ export function loadActiveModelProvider(
     reasoningEffortMax:
       provider.reasoningEffortMax ?? (provider.kind === "deepseek" ? "max" : "auto"),
     wireApi: provider.wireApi ?? (provider.kind === "deepseek" ? "chat_completions" : "auto"),
+  };
+}
+
+/** Explain the same precedence used by execution without exposing credentials. */
+export function loadModelProviderSources(
+  path: string = defaultConfigPath(),
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  const provider = loadActiveModelProvider(path, env);
+  const persisted = loadModelProviders(path, {}).find((item) => item.id === provider.id);
+  const usesEnvironment =
+    provider.kind === "deepseek" ||
+    (provider.id === "custom-legacy" && !readConfig(path).modelProviders?.length);
+  return {
+    apiKey:
+      usesEnvironment && env.DEEPSEEK_API_KEY?.trim()
+        ? "environment"
+        : persisted?.apiKey
+          ? "config"
+          : "unset",
+    baseUrl:
+      usesEnvironment && env.DEEPSEEK_BASE_URL?.trim()
+        ? "environment"
+        : persisted?.baseUrl
+          ? "config"
+          : "default",
+    model: persisted?.model ? "config" : "default",
   };
 }
 

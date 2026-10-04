@@ -4,6 +4,7 @@ import { handleCheckpointDelete } from "./api/checkpoint-delete.js";
 import { handleCheckpointDiffs } from "./api/checkpoint-diffs.js";
 import { handleCheckpointRestore } from "./api/checkpoint-restore.js";
 import { handleCheckpoints } from "./api/checkpoints.js";
+import { handleDelivery } from "./api/delivery.js";
 import { handleEditMode } from "./api/edit-mode.js";
 import { handleFileRead } from "./api/file-read.js";
 import { handleFiles } from "./api/files.js";
@@ -114,6 +115,8 @@ export async function handleApi(
         return await handleLoop(method, rest, body, ctx);
       case "models":
         return await handleModels(method, rest, body, ctx);
+      case "delivery":
+        return await handleDelivery(method, rest, body, ctx);
       default:
         return { status: 404, body: { error: `no such endpoint: /${head}` } };
     }

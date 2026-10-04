@@ -160,7 +160,7 @@ export function HooksPanel() {
             </div>`
           : html`
             <div class="card" style="padding:10px 14px;overflow-x:auto">
-              <div class="matrix" style=${`min-width:fit-content`}>
+              <div class="matrix" style=${"min-width:fit-content"}>
                 <div class="row h" style=${`grid-template-columns:${gridCols}`}>
                   <div>${t("hooks.colScript")}</div>
                   ${events.map((ev) => html`<div>${ev}</div>`)}

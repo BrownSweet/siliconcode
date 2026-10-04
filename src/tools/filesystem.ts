@@ -29,6 +29,8 @@ export interface FilesystemToolsOptions {
   additionalRoots?: readonly string[];
   /** false → register only read-side tools. Default true. */
   allowWriting?: boolean;
+  /** Browser hosts pin one project: ignore historical outside-path grants and reject symlink escapes. */
+  restrictToRoot?: boolean;
   /** Files at or under this size get full content; larger go to outline mode. Default 512 KiB. */
   outlineThresholdBytes?: number;
   /** Cap on total bytes from listing/grep tools — bounds tree-as-one-string accidents. */
@@ -155,6 +157,7 @@ export function registerFilesystemTools(
     toolName: string,
     ctx: ToolCallContext | undefined,
   ): Promise<void> {
+    if (opts.restrictToRoot) throw new Error(`path is outside the selected project: ${abs}`);
     for (const dir of loadProjectPathAllowed(rootDir)) {
       if (pathIsUnder(abs, dir)) return;
     }
@@ -190,6 +193,23 @@ export function registerFilesystemTools(
     }
   }
 
+  async function checkRealPath(abs: string): Promise<string> {
+    if (!opts.restrictToRoot) return abs;
+    let existing = abs;
+    while (true) {
+      try {
+        const real = await fs.realpath(existing);
+        if (!inSandbox(real)) throw new Error(`symlink escapes the selected project: ${abs}`);
+        return abs;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        const parent = pathMod.dirname(existing);
+        if (parent === existing) throw err;
+        existing = parent;
+      }
+    }
+  }
+
   /** Resolve path, route outside-sandbox access through the approval gate, return absolute. */
   const safePath = async (
     raw: unknown,
@@ -202,7 +222,7 @@ export function registerFilesystemTools(
     }
     if (looksLikeAbsoluteSystemPath(raw)) {
       const abs = pathMod.resolve(raw);
-      if (inSandbox(abs)) return abs;
+      if (inSandbox(abs)) return checkRealPath(abs);
       await ensureOutsideSandboxAllowed(abs, intent, toolName, ctx);
       return abs;
     }
@@ -219,7 +239,7 @@ export function registerFilesystemTools(
         `path escapes sandbox root (${normRoot}): ${raw} — use an absolute system path like /Users/foo or C:\\Users\\foo to request approved outside-sandbox access`,
       );
     }
-    return resolved;
+    return checkRealPath(resolved);
   };
 
   /** lstat that swallows ENOENT so we can still gate writes to brand-new paths. */

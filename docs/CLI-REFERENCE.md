@@ -13,6 +13,7 @@ Run `brown --help` (or any subcommand with `--help`) for the full flag list. Hea
 | `brown code [dir]` | Code-mode TUI — file edits, plan mode, edit-gate, project-scoped sessions |
 | `brown chat` | Chat-only TUI — no filesystem access, no code mode |
 | `brown run <task>` | Headless run — read prompt, execute, exit (CI-friendly) |
+| `brown delivery <command>` | Durable requirement-to-production workflow with isolated development, independent audit, human production approval, canary, and rollback |
 | `brown setup` | Interactive first-run config (API key, language, theme) |
 | `brown sessions [name]` | List or open a saved session |
 | `brown prune-sessions` | Drop sessions older than `--days N` |
@@ -25,6 +26,22 @@ Run `brown --help` (or any subcommand with `--help`) for the full flag list. Hea
 | `brown mcp <list\|search\|install\|inspect\|browse>` | MCP server management |
 | `brown index` | Build the local semantic index (Ollama or OpenAI-compatible embeddings) |
 | `brown version` / `brown update` | Version info + upgrade hint |
+
+### Delivery commands
+
+| Command | What it does |
+|---|---|
+| `brown delivery init-config` | Create `.siliconcode/delivery/config.json`; placeholders must be replaced before validation/deployment |
+| `brown delivery config` | Validate and print the command contract |
+| `brown delivery create <requirement>` | Persist a run at requirement intake |
+| `brown delivery list` / `status <id>` | Inspect durable run state |
+| `brown delivery workspace <id>` | Human gate: create the isolated Git branch/worktree |
+| `brown delivery run <id> --yolo` | Run autonomously until a human gate, blocker, terminal state, or turn bound |
+| `brown delivery approve-production <id> --actor <name>` | Human-only production approval |
+| `brown delivery reject-production <id> --actor <name> --comment <text>` | Human-only production rejection |
+| `brown delivery rollback-complete <id> --actor <name> --summary <text>` | Execute configured rollback + post-rollback health commands and persist their observed results |
+
+The local Dashboard exposes the same run/workspace/approval controls. Neither `--yolo` nor Web unattended consent grants production approval.
 
 ### Notable runtime flags (chat / code)
 

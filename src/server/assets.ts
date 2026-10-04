@@ -29,6 +29,23 @@ function resolveAssetDir(): string {
 
 const ASSET_DIR = resolveAssetDir();
 
+/** Public workbench login shell; no credentials are embedded in its assets. */
+export function serveWorkbenchAsset(name: string): { body: string; contentType: string } | null {
+  if (name === "index.html")
+    return {
+      body: loadCachedFile(join(ASSET_DIR, "workbench.html")),
+      contentType: "text/html; charset=utf-8",
+    };
+  if (name === "workbench.js")
+    return {
+      body: loadCachedFile(join(ASSET_DIR, "dist", name)),
+      contentType: "application/javascript; charset=utf-8",
+    };
+  if (name === "workbench.css")
+    return { body: loadCachedFile(join(ASSET_DIR, name)), contentType: "text/css; charset=utf-8" };
+  return null;
+}
+
 /** mtime-keyed cache — `npm run build` invalidates without restart. */
 const fileCache = new Map<string, { body: string; mtimeMs: number }>();
 

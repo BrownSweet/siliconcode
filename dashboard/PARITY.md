@@ -22,6 +22,8 @@ into one row.
 
 ## Core / observability
 
+The **Delivery** tab is a dedicated local-Web surface for durable requirement intake, stage inspection, explicit unattended-run consent, worktree creation, human production approval/rejection, and rollback completion. Production approval is intentionally separate from the autonomous runner.
+
 | Slash | Purpose | Coverage |
 |---|---|---|
 | `/help` | command reference | chat-box |

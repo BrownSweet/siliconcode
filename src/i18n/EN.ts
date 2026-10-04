@@ -18,7 +18,7 @@ export const EN: TranslationSchema = {
     description: "Silicon Code — Chinese-first DeepSeek coding agent for terminal workflows.",
     continue: "Resume the most recently used chat session without showing the picker.",
     setup: "Interactive wizard — API key, preset, MCP servers. Re-run any time to reconfigure.",
-    code: "Code-editing chat — filesystem tools rooted at <dir> (default: cwd), coding system prompt, deepseek-v4-flash baseline.",
+    code: "Code-editing chat — filesystem tools rooted at <dir> (default: cwd), coding system prompt, deepseek-flash baseline.",
     chat: "Interactive Ink TUI with live cache/cost panel.",
     run: "Run a single task non-interactively, streaming output.",
     stats: "Show usage dashboard.",
@@ -195,7 +195,7 @@ export const EN: TranslationSchema = {
     newHint: "force a fresh session (ignore --session / --continue)",
     transcriptHint: "path to write the JSONL transcript",
     budgetHint: "session USD cap — warns at 80%, refuses next turn at 100%",
-    modelIdHint: "DeepSeek model id (e.g. deepseek-v4-flash)",
+    modelIdHint: "DeepSeek model id (e.g. deepseek-flash)",
     systemPromptHint: "override the default system prompt",
     presetHint: "model bundle — auto|flash|pro",
     sessionNameHint: "session name (default: 'default')",
@@ -247,7 +247,7 @@ export const EN: TranslationSchema = {
     mcpMaxPagesHint: "cap how many pages to walk while searching (default 20)",
     jsonHintCatalog: "output as JSON",
     jsonHintReport: "output the inspection report as JSON",
-    modelOverrideFlash: "override the model (default: deepseek-v4-flash)",
+    modelOverrideFlash: "override the model (default: deepseek-flash)",
     skipConfirmHint: "skip the confirmation prompt",
     yoloHint:
       "auto-approve plan checkpoints for this invocation (equivalent to editMode=yolo without mutating config)",
@@ -1001,7 +1001,7 @@ export const EN: TranslationSchema = {
       cwdUsageNoCurrent: "usage: /cwd <path>   re-points the workspace root to <path>.",
     },
     model: {
-      modelHint: "try deepseek-v4-flash or deepseek-v4-pro — run /models to fetch the live list",
+      modelHint: "try deepseek-flash or deepseek-v4-pro — run /models to fetch the live list",
       modelUsage: "usage: /model <id>   ({hint})",
       modelNotInCatalog:
         "model → {id}   (⚠ not in the fetched catalog: {list}. If this is wrong the next call will 400 — run /models to refresh.)",

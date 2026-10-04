@@ -255,6 +255,15 @@ export class JobRegistry {
     // still wired for the no-exit fallback (spawn error before any process exists).
     const settleClosed = (code: number | null) => {
       if (!job.running && job.exitCode !== null) return;
+      // A wrapper can exit before its children. On POSIX the detached group still
+      // owns those children; do not leave them alive after this job becomes terminal.
+      if (process.platform !== "win32" && job.running && job.pid !== null) {
+        try {
+          process.kill(-job.pid, "SIGKILL");
+        } catch {
+          /* group already exited */
+        }
+      }
       job.running = false;
       job.exitCode = code;
       job.signalReady();
@@ -424,7 +433,7 @@ export class JobRegistry {
           /* ignore */
         }
     }
-    const allClose = Promise.all(runningJobs.map((j) => j.readyPromise));
+    const allClose = Promise.all(runningJobs.map((j) => j.closedPromise));
     const elapsed = () => Date.now() - start;
     // Grace window: give well-behaved apps time to clean up, capped at
     // half the deadline so we always leave room for a SIGKILL pass +

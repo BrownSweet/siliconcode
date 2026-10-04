@@ -13,7 +13,7 @@ import { FLASH_MODEL_ID } from "../../models.js";
 import { activeProviderClientOptions } from "../../provider-client-options.js";
 
 export interface CommitOptions {
-  /** Override the default model (deepseek-v4-flash). */
+  /** Override the default model (deepseek-flash). */
   model?: string;
   /** Skip the confirmation step — useful in scripts where the diff has been pre-reviewed. */
   yes?: boolean;

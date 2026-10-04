@@ -37,7 +37,7 @@ export async function fetchWithRetry(
   let lastError: unknown;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    if (opts.signal?.aborted) throw new Error("aborted");
+    if (opts.signal?.aborted) throw opts.signal.reason ?? new DOMException("aborted", "AbortError");
 
     try {
       const resp = await fetchFn(url, init);
@@ -54,7 +54,7 @@ export async function fetchWithRetry(
 
       const waitMs = computeWait(attempt, initial, cap, resp.headers.get("Retry-After"));
       opts.onRetry?.({ attempt: attempt + 1, reason: `http ${resp.status}`, waitMs });
-      await sleep(waitMs, opts.signal);
+      await abortableSleep(waitMs, opts.signal);
     } catch (err) {
       lastError = err;
       // Respect explicit aborts — do not retry.
@@ -67,7 +67,7 @@ export async function fetchWithRetry(
         reason: `network: ${messageOf(err)}`,
         waitMs,
       });
-      await sleep(waitMs, opts.signal);
+      await abortableSleep(waitMs, opts.signal);
     }
   }
 
@@ -92,18 +92,22 @@ function computeWait(
   return Math.min(Math.max(jitter, 0), cap);
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted)
+    return Promise.reject(signal.reason ?? new DOMException("aborted", "AbortError"));
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    if (signal) {
-      const onAbort = () => {
-        clearTimeout(timer);
-        reject(new Error("aborted"));
-      };
-      if (signal.aborted) onAbort();
-      else signal.addEventListener("abort", onAbort, { once: true });
-    }
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(signal?.reason ?? new DOMException("aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 

@@ -41,16 +41,16 @@ describe("Usage.cacheHitRatio", () => {
 });
 
 describe("costUsd", () => {
-  it("matches DeepSeek's published V4 USD pricing sheet", () => {
+  it("uses the published peak USD rates for conservative budget estimates", () => {
     expect(DEEPSEEK_PRICING["deepseek-v4-flash"]).toEqual({
-      inputCacheHit: 0.0028,
-      inputCacheMiss: 0.14,
-      output: 0.28,
+      inputCacheHit: 0.006,
+      inputCacheMiss: 0.3,
+      output: 1.2,
     });
     expect(DEEPSEEK_PRICING["deepseek-v4-pro"]).toEqual({
-      inputCacheHit: 0.003625,
-      inputCacheMiss: 0.435,
-      output: 0.87,
+      inputCacheHit: 0.044,
+      inputCacheMiss: 1.32,
+      output: 3.96,
     });
   });
 

@@ -236,7 +236,7 @@ export function ChatPanel() {
       void refetchCanonicalState();
     };
     es.onmessage = (ev) => {
-      let dash;
+      let dash: any;
       try {
         dash = JSON.parse(ev.data);
       } catch {
@@ -329,7 +329,7 @@ export function ChatPanel() {
       es.close();
       cancelStreamingRaf();
     };
-  }, [refetchCanonicalState, cancelStreamingRaf]);
+  }, [refetchCanonicalState, cancelStreamingRaf, flushStreaming]);
 
   // Stable callbacks so the memo'd <ChatInput/> doesn't re-render on every
   // unrelated parent state change. Live values (busy, messages.length) flow
@@ -429,6 +429,7 @@ export function ChatPanel() {
     return () => el.removeEventListener("scroll", onScroll);
   }, []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Content changes trigger scrolling through the DOM ref.
   useEffect(() => {
     if (!shouldAutoScroll.current) return;
     const el = feedRef.current;

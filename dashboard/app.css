@@ -3625,3 +3625,5 @@ input:focus, textarea:focus, select:focus { border-color: var(--c-brand); }
 [data-theme="light"] *::-webkit-scrollbar-thumb:hover {
   background: var(--fg-4);
 }
+
+.execution-result-summary{border:1px solid var(--bd);border-radius:8px;padding:14px;margin-bottom:18px}.execution-result-summary h3{font-size:14px;margin:0 0 10px}.execution-result-summary dl>div{display:flex;justify-content:space-between;gap:12px;padding:4px 0}.execution-result-summary dt,.execution-result-summary dd{font-size:12px;margin:0}.execution-result-summary p{font-size:11px;line-height:1.6;opacity:.75}.execution-result-summary [data-state=failed]{color:var(--c-err)}.execution-result-summary [data-state=passed]{color:var(--c-ok)}

@@ -13,7 +13,7 @@ export function useReviewDiffs() {
   const [diffs, setDiffs] = useState<FileDiff[]>([]);
   const [loading, setLoading] = useState(false);
 
-  const loadDiffs = useCallback(async (ep: string = "/review-diffs") => {
+  const loadDiffs = useCallback(async (ep = "/review-diffs") => {
     setLoading(true);
     try {
       const data = await api<FileDiff[]>(ep);

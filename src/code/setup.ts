@@ -16,6 +16,7 @@ import { bootstrapSemanticSearchInCodeMode } from "../index/semantic/tool.js";
 import { providerClientOptions } from "../provider-client-options.js";
 import { ToolRegistry } from "../tools.js";
 import { registerChoiceTool } from "../tools/choice.js";
+import { registerDeliveryTools } from "../tools/delivery.js";
 import { registerFilesystemTools } from "../tools/filesystem.js";
 import { JobRegistry } from "../tools/jobs.js";
 import { registerMemoryTools } from "../tools/memory.js";
@@ -29,6 +30,10 @@ import { registerWebTools } from "../tools/web.js";
 
 export interface CodeToolsetOpts {
   rootDir: string;
+  /** Explicit automation authorization for non-interactive hosts. */
+  allowAll?: boolean;
+  /** Persist delivery state in the source workspace while tools operate in an isolated worktree. */
+  deliveryWorkspaceRoot?: string;
   /** Internal/test hook: read Silicon config from this path instead of the user's home config. */
   configPath?: string;
   /** Fired after `install_skill` writes a new skill — desktop wires this to push a fresh `$skills` event so the sidebar updates without a tab reload. */
@@ -111,14 +116,19 @@ export async function buildCodeToolset(opts: CodeToolsetOpts): Promise<CodeTools
     const cfg = readConfig(opts.configPath);
     registerShellTools(tools, {
       rootDir: primaryRoot,
+      additionalRoots,
       extraAllowed: () => loadProjectShellAllowed(primaryRoot, opts.configPath),
-      allowAll: () => loadEditMode(opts.configPath) === "yolo",
+      allowAll: () => opts.allowAll === true || loadEditMode(opts.configPath) === "yolo",
       requireApprovalForBuiltin: true,
       jobs,
       onJobsChanged: opts.onJobsChanged,
       sensitivePaths: cfg.sensitivePaths,
     });
     registerMemoryTools(tools, { projectRoot: primaryRoot });
+    registerDeliveryTools(tools, {
+      workspaceRoot: opts.deliveryWorkspaceRoot ?? primaryRoot,
+      addWorkspaceRoot: (path) => addRoot(path),
+    });
     // Scaffold + skills are project-scoped too: re-root them so /cwd points
     // create_skill / run_skill at the active project (not the launch dir).
     registerScaffoldTools(tools, { projectRoot: primaryRoot });

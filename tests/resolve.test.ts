@@ -39,7 +39,7 @@ describe("resolveDefaults", () => {
 
   it("empty flags + empty config → auto preset (flash + max)", () => {
     const r = resolveDefaults({});
-    expect(r.model).toBe("deepseek-v4-flash");
+    expect(r.model).toBe("deepseek-flash");
     expect(r.reasoningEffort).toBe("max");
     expect(r.mcp).toEqual([]);
     expect(r.session).toBe("default");
@@ -48,7 +48,7 @@ describe("resolveDefaults", () => {
   it("config.preset 'fast' drops effort to high (still flash)", () => {
     writeConfig({ preset: "fast" }, join(home, ".siliconcode", "config.json"));
     const r = resolveDefaults({});
-    expect(r.model).toBe("deepseek-v4-flash");
+    expect(r.model).toBe("deepseek-flash");
     expect(r.reasoningEffort).toBe("high");
   });
 
@@ -106,7 +106,7 @@ describe("resolveDefaults", () => {
       join(home, ".siliconcode", "config.json"),
     );
     const r = resolveDefaults({ noConfig: true });
-    expect(r.model).toBe("deepseek-v4-flash"); // smart defaults (new default)
+    expect(r.model).toBe("deepseek-flash"); // smart defaults (new default)
     expect(r.reasoningEffort).toBe("max");
     expect(r.mcp).toEqual([]);
   });

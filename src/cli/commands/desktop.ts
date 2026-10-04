@@ -1968,7 +1968,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
             apiKey,
             baseUrl,
             model: model || resolvePreset(msg.preset ?? "auto").model,
-            models: ["deepseek-v4-flash", "deepseek-v4-pro"],
+            models: ["deepseek-flash", "deepseek-v4-pro"],
             preset: msg.preset ?? "auto",
             reasoningEffortMax: msg.reasoningEffortMax ?? "max",
             wireApi: "chat_completions",

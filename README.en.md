@@ -82,9 +82,12 @@ brown init --force --yes
 The command reads repository manifests, directories, and tool configuration without
 calling a model. Existing rules are protected unless `--force` is supplied.
 
-Model presets use the current DeepSeek V4 API IDs: `flash` maps to
-`deepseek-v4-flash`, `pro` maps to `deepseek-v4-pro`, and `auto` starts on Flash
-with one-turn Pro escalation for harder turns.
+Model presets use the official recommended API IDs: `flash` maps to
+`deepseek-flash`, `pro` maps to `deepseek-v4-pro`, and `auto` starts on Flash
+with one-turn Pro escalation for harder turns. Existing `deepseek-v4-flash` pins
+remain supported aliases. Verified on 2026-10-03 against the
+[official model and pricing documentation](https://api-docs.deepseek.com/quick_start/pricing/);
+cost estimates use peak rates, while actual off-peak billing may be lower.
 
 Desktop also supports standard OpenAI-compatible providers. Under
 **Settings -> Models -> Add model provider**, enter the Base URL and API key first;

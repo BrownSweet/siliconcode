@@ -171,6 +171,7 @@ src/
 │   ├── subagent.ts         # spawn_subagent — flash+high by default
 │   ├── plan.ts             # submit_plan (review gate)
 │   └── web.ts              # web_search, web_fetch (multi-engine: Mojeek, SearXNG or Metaso)
+├── delivery/               # durable requirement → worktree → audit → staging → canary state machine
 ├── mcp/                    # MCP client + bridge (stdio + SSE)
 ├── memory.ts               # ImmutablePrefix / AppendOnlyLog / VolatileScratch
 ├── project-memory.ts       # SILICON.md loader
@@ -227,14 +228,19 @@ public command reference that surfaces the slash list.
   release notes, final package dry-run, desktop signing decisions, and a
   documented opt-in path for the optional `carbon` alias.
 
+### Durable autonomous delivery
+
+The delivery subsystem is a first-class orchestration path rather than an unbounded `/loop`. It stores an authoritative stage machine and audit trail under `.siliconcode/delivery`, uses a real Git worktree, binds validation/deployment gates to an explicit project command contract, delegates four audit dimensions to isolated read-only Skills, and stops at an unforgeable human production approval gate. The embedded Dashboard is a local attached control plane; it does not turn Silicon Code into a hosted SaaS.
+
+See `docs/superpowers/specs/2026-09-23-autonomous-delivery.md` for the PRD, component boundaries, safety model, and acceptance criteria.
+
 ## Explicit non-goals
 
-- Multi-agent orchestration as a first-class concept (subagents are a
-  cost-reduction mechanism, not a coordination primitive).
 - RAG / vector retrieval.
 - Support for non-DeepSeek backends (an OpenAI-compatible shim would
   work today via `--model` override, but is not tested).
-- Web UI / SaaS.
+- Hosted multi-tenant SaaS. The attached local Dashboard is supported.
+- General-purpose autonomous organization simulation outside the bounded delivery state machine.
 - Automatic cost escalation without user-visible announcement. Every
   pro-tier model call is surfaced; silent escalation was considered
   and rejected.

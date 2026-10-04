@@ -8,7 +8,7 @@ import {
   normalizeProviderBaseUrl,
   providerApiKeyValidationError,
 } from "./provider-probe.js";
-import { type RetryOptions, fetchWithRetry } from "./retry.js";
+import { type RetryOptions, abortableSleep, fetchWithRetry } from "./retry.js";
 import type { ChatMessage, ChatRequestOptions, RawUsage, ToolCall, ToolSpec } from "./types.js";
 
 type ConcreteWireApi = Exclude<ProviderWireApi, "auto">;
@@ -187,6 +187,8 @@ export interface DeepSeekClientOptions {
   /** Whether this endpoint accepts DeepSeek's top-level `thinking` extension. */
   sendThinking?: boolean;
   timeoutMs?: number;
+  /** Maximum wait for another stream byte. Independent of the total request deadline. */
+  streamIdleTimeoutMs?: number;
   fetch?: typeof fetch;
   rateLimit?: { rpm?: number };
   /** Retry configuration. Pass `{ maxAttempts: 1 }` to disable retries. */
@@ -286,8 +288,8 @@ function providerResponseError(providerName: string, response: any): Error {
   return transient ? new RetryableProviderResponseError(errorMessage) : new Error(errorMessage);
 }
 
-async function waitForEmptySemanticRetry(attempt: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+async function waitForEmptySemanticRetry(attempt: number, signal?: AbortSignal): Promise<void> {
+  await abortableSleep(250 * attempt, signal);
 }
 
 export class DeepSeekClient {
@@ -299,6 +301,7 @@ export class DeepSeekClient {
   readonly maxTools: number | null;
   readonly sendThinking: boolean;
   readonly timeoutMs: number;
+  readonly streamIdleTimeoutMs: number;
   readonly retry: RetryOptions;
   private readonly _fetch: typeof fetch;
   private readonly minChatIntervalMs: number;
@@ -332,6 +335,7 @@ export class DeepSeekClient {
     this.maxTools = opts.maxTools === undefined ? DEEPSEEK_MAX_TOOLS : opts.maxTools;
     this.sendThinking = opts.sendThinking ?? true;
     this.timeoutMs = opts.timeoutMs ?? 660_000;
+    this.streamIdleTimeoutMs = opts.streamIdleTimeoutMs ?? 120_000;
     this._fetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.retry = opts.retry ?? {};
     const rpm = opts.rateLimit?.rpm ?? loadRateLimit()?.rpm;
@@ -339,22 +343,13 @@ export class DeepSeekClient {
   }
 
   private async waitForChatRateLimit(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw abortError(signal);
     if (this.minChatIntervalMs <= 0) return;
     const now = Date.now();
     const waitMs = Math.max(0, this.nextChatRequestAt - now);
     this.nextChatRequestAt = Math.max(now, this.nextChatRequestAt) + this.minChatIntervalMs;
     if (waitMs <= 0) return;
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(resolve, waitMs);
-      signal?.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(timer);
-          reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
-        },
-        { once: true },
-      );
-    });
+    await abortableSleep(waitMs, signal);
   }
 
   private validateTools(opts: ChatRequestOptions): void {
@@ -604,8 +599,14 @@ export class DeepSeekClient {
 
   async chat(opts: ChatRequestOptions): Promise<ChatResponse> {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
-    const signal = opts.signal ?? ctrl.signal;
+    const timer = setTimeout(
+      () =>
+        ctrl.abort(
+          new DOMException(`LLM request timed out after ${this.timeoutMs}ms`, "TimeoutError"),
+        ),
+      this.timeoutMs,
+    );
+    const signal = opts.signal ? AbortSignal.any([opts.signal, ctrl.signal]) : ctrl.signal;
     let endpoint = "";
     let reported = false;
     try {
@@ -656,7 +657,7 @@ export class DeepSeekClient {
               error instanceof RetryableProviderResponseError) &&
             !signal.aborted
           ) {
-            await waitForEmptySemanticRetry(semanticAttempt + 1);
+            await waitForEmptySemanticRetry(semanticAttempt + 1, signal);
             continue;
           }
           throw error;
@@ -711,7 +712,7 @@ export class DeepSeekClient {
             error instanceof RetryableProviderResponseError) &&
           !opts.signal?.aborted
         ) {
-          await waitForEmptySemanticRetry(semanticAttempt + 1);
+          await waitForEmptySemanticRetry(semanticAttempt + 1, opts.signal);
           continue;
         }
         throw error;
@@ -721,8 +722,14 @@ export class DeepSeekClient {
 
   private async *streamOnce(opts: ChatRequestOptions): AsyncGenerator<StreamChunk> {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
-    const signal = opts.signal ?? ctrl.signal;
+    const timer = setTimeout(
+      () =>
+        ctrl.abort(
+          new DOMException(`LLM request timed out after ${this.timeoutMs}ms`, "TimeoutError"),
+        ),
+      this.timeoutMs,
+    );
+    const signal = opts.signal ? AbortSignal.any([opts.signal, ctrl.signal]) : ctrl.signal;
 
     let opened: OpenedRequest;
     try {
@@ -750,6 +757,7 @@ export class DeepSeekClient {
     const queue: StreamChunk[] = [];
     let queueIndex = 0;
     let done = false;
+    let sawFinishReason = false;
     let malformedFrameCount = 0;
     let terminalError: Error | null = null;
     let sawResponsesToolCall = false;
@@ -886,7 +894,13 @@ export class DeepSeekClient {
 
     const parser = createParser({
       onEvent: (event: EventSourceMessage) => {
-        if (!event.data || event.data === "[DONE]") {
+        if (!event.data) return;
+        if (event.data === "[DONE]") {
+          if (opened.wireApi === "responses" && !done) {
+            terminalError = new Error(
+              `${this.providerName} stream disconnected before response.completed`,
+            );
+          }
           done = true;
           return;
         }
@@ -898,6 +912,7 @@ export class DeepSeekClient {
           }
           const delta = json.choices?.[0]?.delta ?? {};
           const finishReason = json.choices?.[0]?.finish_reason ?? undefined;
+          if (finishReason) sawFinishReason = true;
           const chunk: StreamChunk = { raw: json, finishReason };
           if (typeof delta.content === "string" && delta.content.length > 0) {
             sawMeaningfulOutput = true;
@@ -949,7 +964,23 @@ export class DeepSeekClient {
         }
         if (terminalError) throw terminalError;
         if (done) break;
-        const { value, done: streamDone } = await reader.read();
+        const idleTimer = setTimeout(
+          () =>
+            ctrl.abort(
+              new DOMException(
+                `LLM stream idle timeout after ${this.streamIdleTimeoutMs}ms`,
+                "TimeoutError",
+              ),
+            ),
+          this.streamIdleTimeoutMs,
+        );
+        let part: Awaited<ReturnType<typeof reader.read>>;
+        try {
+          part = await reader.read();
+        } finally {
+          clearTimeout(idleTimer);
+        }
+        const { value, done: streamDone } = part;
         throwIfAborted();
         if (streamDone) break;
         parser.feed(decoder.decode(value, { stream: true }));
@@ -958,6 +989,11 @@ export class DeepSeekClient {
       if (terminalError) throw terminalError;
       if (!sawMeaningfulOutput) {
         throw emptySemanticResponseError(this.providerName);
+      }
+      if (!done && !sawFinishReason) {
+        throw new Error(
+          `${this.providerName} stream disconnected before completion; partial output was preserved. Retry explicitly after checking tool results.`,
+        );
       }
       if (malformedFrameCount > 0) yield { raw: null, malformedFrameCount };
     } catch (error) {
@@ -969,6 +1005,7 @@ export class DeepSeekClient {
     } finally {
       signal.removeEventListener("abort", cancelReader);
       clearTimeout(timer);
+      await reader.cancel().catch(() => undefined);
       try {
         reader.releaseLock();
       } catch {

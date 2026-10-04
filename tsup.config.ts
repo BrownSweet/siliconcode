@@ -28,7 +28,7 @@ export default defineConfig([
     },
   },
   {
-    entry: { app: "dashboard/app.js" },
+    entry: { app: "dashboard/app.js", workbench: "dashboard/src/workbench.ts" },
     format: ["esm"],
     dts: false,
     clean: true,

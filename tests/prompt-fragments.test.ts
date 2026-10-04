@@ -24,8 +24,8 @@ describe("escalationContract (#582)", () => {
     expect(out).not.toMatch(/running on `?deepseek-v4-flash`?/);
   });
 
-  it("backward-compat const matches the historical flash phrasing", () => {
-    expect(ESCALATION_CONTRACT).toBe(escalationContract("deepseek-v4-flash"));
+  it("default contract follows the recommended Flash ID", () => {
+    expect(ESCALATION_CONTRACT).toBe(escalationContract("deepseek-flash"));
   });
 
   it("treats unknown future tiers as non-pro (full contract, name themselves)", () => {

@@ -2,12 +2,19 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadModel, loadThinkingMode, saveModel, writeConfig } from "../src/config.js";
+import {
+  loadModel,
+  loadModelProviders,
+  loadThinkingMode,
+  saveModel,
+  writeConfig,
+} from "../src/config.js";
 import {
   DEEPSEEK_MAX_TOOLS,
   DEFAULT_CONTEXT_TOKENS,
   FLASH_MODEL_ID,
   PRO_MODEL_ID,
+  SELECTABLE_MODEL_IDS,
   migrateRetiredModel,
   resolveThinkingPreference,
   toolResultBudgetForModel,
@@ -27,10 +34,26 @@ afterEach(() => {
 });
 
 describe("model capability registry", () => {
+  it("defaults to the recommended ID while preserving explicit accepted aliases", () => {
+    expect(FLASH_MODEL_ID).toBe("deepseek-flash");
+    expect(SELECTABLE_MODEL_IDS).toEqual(["deepseek-flash", "deepseek-v4-pro"]);
+    expect(migrateRetiredModel("deepseek-v4-flash")).toEqual({
+      model: "deepseek-v4-flash",
+      migrated: false,
+    });
+    expect(pricingFor("deepseek-v4-flash")).toEqual(pricingFor(FLASH_MODEL_ID));
+    const path = configPath();
+    writeConfig({ model: FLASH_MODEL_ID }, path);
+    expect(loadModelProviders(path, {})[0]?.kind).toBe("deepseek");
+    saveModel("deepseek-v4-flash", path);
+    expect(loadModel(path)).toBe("deepseek-v4-flash");
+  });
   it("describes current V4 models from one registry", () => {
     expect(resolveThinkingPreference(FLASH_MODEL_ID)).toBe("enabled");
     expect(resolveThinkingPreference(PRO_MODEL_ID, "disabled")).toBe("disabled");
-    expect(pricingFor(PRO_MODEL_ID)?.output).toBe(0.87);
+    expect(pricingFor(PRO_MODEL_ID)?.output).toBe(3.96);
+    expect(pricingFor("deepseek-flash")?.output).toBe(1.2);
+    expect(contextTokensFor("deepseek-flash")).toBe(1_000_000);
     expect(contextTokensFor(PRO_MODEL_ID)).toBe(1_000_000);
     expect(toolResultBudgetForModel(PRO_MODEL_ID)).toBe(20_000);
     expect(DEEPSEEK_MAX_TOOLS).toBe(128);

@@ -1,6 +1,6 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type ConfirmationChoice, PauseGate } from "../src/core/pause-gate.js";
 import { ToolRegistry } from "../src/tools.js";
@@ -592,6 +592,40 @@ describe("registerShellTools — dispatch integration", () => {
     );
     expect(out).toMatch(/\[exit 0\]/);
     expect(out).toContain("ok");
+  });
+
+  it("runs commands inside an explicitly trusted additional worktree root", async () => {
+    const worktree = mkdtempSync(join(tmpdir(), "silicon-shell-worktree-"));
+    writeFileSync(join(worktree, "marker.txt"), "worktree");
+    const registry = new ToolRegistry();
+    registerShellTools(registry, {
+      rootDir: tmp,
+      additionalRoots: [worktree],
+      allowAll: true,
+    });
+    try {
+      const out = await registry.dispatch(
+        "run_command",
+        JSON.stringify({
+          command:
+            "node -e \"process.stdout.write(require('fs').readFileSync('marker.txt','utf8'))\"",
+          cwd: worktree,
+        }),
+      );
+      expect(out).toContain("worktree");
+    } finally {
+      rmSync(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects command cwd outside every trusted workspace root", async () => {
+    const registry = new ToolRegistry();
+    registerShellTools(registry, { rootDir: tmp, allowAll: true });
+    const out = await registry.dispatch(
+      "run_command",
+      JSON.stringify({ command: "node --version", cwd: dirname(tmp) }),
+    );
+    expect(out).toMatch(/outside trusted workspace roots/);
   });
 
   it("extraAllowed as a getter is re-read on every dispatch", async () => {

@@ -37,6 +37,8 @@ export {
 export interface ShellToolsOptions {
   /** Directory to run commands in. Must be an absolute path. */
   rootDir: string;
+  /** Extra trusted roots added through /add-dir, including delivery worktrees. */
+  additionalRoots?: readonly string[];
   /** Seconds before an individual command is killed. Default: 60. */
   timeoutSec?: number;
   maxOutputChars?: number;
@@ -91,8 +93,8 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
   // are wrapped into a thunk for uniformity.
   const isAllowAll: () => boolean =
     typeof opts.allowAll === "function" ? opts.allowAll : () => opts.allowAll === true;
-  const isAutoAllowed = (cmd: string): boolean =>
-    isCommandAllowed(cmd, getExtraAllowed(), rootDir, opts.sensitivePaths, {
+  const isAutoAllowed = (cmd: string, cwd = rootDir): boolean =>
+    isCommandAllowed(cmd, getExtraAllowed(), cwd, opts.sensitivePaths, {
       includeBuiltin: opts.requireApprovalForBuiltin !== true,
     });
   const approvalPolicy = opts.requireApprovalForBuiltin
@@ -101,7 +103,7 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
 
   registry.register({
     name: "run_command",
-    description: `Run a shell command in the project root; returns combined stdout+stderr. ${approvalPolicy}\n\nConstraints (no real shell — argv is parsed natively for cross-platform parity):\n• Supported: chain ops \`|\` / \`||\` / \`&&\` / \`;\` (each segment allowlist-checked individually), file redirects \`>\` / \`>>\` / \`<\` / \`2>\` / \`2>>\` / \`2>&1\` / \`&>\` (target paths resolve relative to project root, max one redirect per fd per segment).\n• NOT supported: background \`&\`, heredoc \`<<\`, command substitution \`$(…)\`, subshells \`(…)\`, process substitution \`<(…)\`, \`$VAR\` env expansion, glob expansion. To pass an operator char as literal arg, quote it (\`grep "a|b" file\`).\n• \`cd\` does NOT persist — between calls OR within a chain like \`cd dir && cmd\`. Use the binary's own cwd flag: \`npm --prefix <dir>\`, \`git -C <dir>\`, \`cargo -C <dir>\`, \`pytest <dir>/tests\`.\n• Filter at source — unbounded output (\`netstat -ano\`, \`find /\`) wastes tokens. Use \`grep -c\`, \`wc -l\`, narrower paths, etc.`,
+    description: `Run a shell command in a trusted workspace root; returns combined stdout+stderr. ${approvalPolicy}\n\nConstraints (no real shell — argv is parsed natively for cross-platform parity):\n• Supported: chain ops \`|\` / \`||\` / \`&&\` / \`;\` (each segment allowlist-checked individually), file redirects \`>\` / \`>>\` / \`<\` / \`2>\` / \`2>>\` / \`2>&1\` / \`&>\` (target paths resolve relative to the selected cwd, max one redirect per fd per segment).\n• NOT supported: background \`&\`, heredoc \`<<\`, command substitution \`$(…)\`, subshells \`(…)\`, process substitution \`<(…)\`, \`$VAR\` env expansion, glob expansion. To pass an operator char as literal arg, quote it (\`grep "a|b" file\`).\n• \`cd\` does NOT persist — pass the trusted workspace or delivery worktree with the \`cwd\` parameter.\n• Filter at source — unbounded output (\`netstat -ano\`, \`find /\`) wastes tokens. Use \`grep -c\`, \`wc -l\`, narrower paths, etc.`,
     // Plan-mode gate: allow allowlisted commands through (git status,
     // cargo check, ls, grep …) so the model can actually investigate
     // during planning. Anything that would otherwise trigger a
@@ -120,6 +122,11 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
           description:
             'Full command line. POSIX-ish quoting. Chain operators `|`, `||`, `&&`, `;` and file redirects `>` / `>>` / `<` / `2>` / `2>>` / `2>&1` / `&>` work natively (no shell). Background `&`, heredoc `<<`, env-var expansion `$VAR`, and command substitution `$(…)` are rejected (or passed through as literal in the case of `$VAR`). To pass an operator character as a literal argument (e.g. a regex), wrap it in quotes: `grep "a|b" file.txt`.',
         },
+        cwd: {
+          type: "string",
+          description:
+            "Working directory. Relative paths resolve from the primary workspace; absolute paths must be inside the primary workspace or a trusted /add-dir root.",
+        },
         timeoutSec: {
           type: "integer",
           description: `Override the default ${timeoutSec}s timeout for a single command.`,
@@ -127,16 +134,17 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
       },
       required: ["command"],
     },
-    fn: async (args: { command: string; timeoutSec?: number }, ctx) => {
+    fn: async (args: { command: string; cwd?: string; timeoutSec?: number }, ctx) => {
       const cmd = args.command.trim();
       if (!cmd) throw new Error("run_command: empty command");
+      const cwd = resolveCwdInsideRoots(rootDir, opts.additionalRoots, args.cwd, "run_command");
       const effectiveTimeout = Math.max(1, Math.min(600, args.timeoutSec ?? timeoutSec));
-      if (!isAllowAll() && !isAutoAllowed(cmd)) {
+      if (!isAllowAll() && !isAutoAllowed(cmd, cwd)) {
         const gate = ctx?.confirmationGate ?? pauseGate;
         const waitStartedAt = Date.now();
         const choice = await gate.ask({
           kind: "run_command",
-          payload: { command: cmd, cwd: rootDir, timeoutSec: effectiveTimeout },
+          payload: { command: cmd, cwd, timeoutSec: effectiveTimeout },
         });
         ctx?.onInteractiveWait?.(Date.now() - waitStartedAt);
         if (choice.type === "deny") {
@@ -152,7 +160,7 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
         // "run_once" — fall through and execute
       }
       const result = await runCommand(cmd, {
-        cwd: rootDir,
+        cwd,
         timeoutSec: effectiveTimeout,
         maxOutputChars,
         signal: ctx?.signal,
@@ -189,8 +197,8 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
     fn: async (args: { command: string; cwd?: string; waitSec?: number }, ctx) => {
       const cmd = args.command.trim();
       if (!cmd) throw new Error("run_background: empty command");
-      const cwd = resolveCwdInsideRoot(rootDir, args.cwd);
-      if (!isAllowAll() && !isAutoAllowed(cmd)) {
+      const cwd = resolveCwdInsideRoots(rootDir, opts.additionalRoots, args.cwd, "run_background");
+      if (!isAllowAll() && !isAutoAllowed(cmd, cwd)) {
         const gate = ctx?.confirmationGate ?? pauseGate;
         const waitStartedAt = Date.now();
         const choice = await gate.ask({
@@ -335,14 +343,23 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
   return registry;
 }
 
-function resolveCwdInsideRoot(rootDir: string, raw: string | undefined): string {
-  const root = pathMod.resolve(rootDir);
-  if (!raw || !raw.trim()) return root;
-  const resolved = pathMod.resolve(root, raw);
-  const rel = pathMod.relative(root, resolved);
-  if (rel.startsWith("..") || pathMod.isAbsolute(rel)) {
+function resolveCwdInsideRoots(
+  rootDir: string,
+  additionalRoots: readonly string[] | undefined,
+  raw: string | undefined,
+  toolName: string,
+): string {
+  const primaryRoot = pathMod.resolve(rootDir);
+  if (!raw || !raw.trim()) return primaryRoot;
+  const resolved = pathMod.resolve(primaryRoot, raw);
+  const roots = [primaryRoot, ...(additionalRoots ?? []).map((root) => pathMod.resolve(root))];
+  const isAllowed = roots.some((root) => {
+    const rel = pathMod.relative(root, resolved);
+    return rel === "" || (!rel.startsWith("..") && !pathMod.isAbsolute(rel));
+  });
+  if (!isAllowed) {
     throw new Error(
-      `run_background: cwd "${raw}" resolves outside the workspace root (${root}). Pass a workspace-relative path.`,
+      `${toolName}: cwd "${raw}" resolves outside trusted workspace roots. Pass a path inside the primary workspace or a /add-dir root.`,
     );
   }
   return resolved;

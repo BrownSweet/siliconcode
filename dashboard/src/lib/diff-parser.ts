@@ -30,10 +30,10 @@ export function parseHunks(patch: string): Hunk[] {
     // Start of a hunk: @@ -oldStart[,oldLines] +newStart[,newLines] @@
     const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
     if (m) {
-      const oldStart = parseInt(m[1]!, 10);
-      const oldLen = m[2] !== undefined ? parseInt(m[2], 10) : 1;
-      const newStart = parseInt(m[3]!, 10);
-      const newLen = m[4] !== undefined ? parseInt(m[4], 10) : 1;
+      const oldStart = Number.parseInt(m[1]!, 10);
+      const oldLen = m[2] !== undefined ? Number.parseInt(m[2], 10) : 1;
+      const newStart = Number.parseInt(m[3]!, 10);
+      const newLen = m[4] !== undefined ? Number.parseInt(m[4], 10) : 1;
 
       const lines: HunkLine[] = [];
       let oldNum = oldStart;

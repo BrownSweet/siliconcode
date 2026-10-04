@@ -1,6 +1,6 @@
 # Silicon Code
 
-Silicon Code 是一款类似 Claude Code 的代码开发工具，也是中国第一个基于 DeepSeek 的代码开发工具，Token 成本节省 90% 以上。它可以实现自动任务拆分、自动开发、MCP 测试，以及与 Claude、Codex 等多 Agent 协作，能力接近 Claude Sonnet 4.6。
+Silicon Code 是面向个人开发者的 DeepSeek 编码工作台，以 Codex 的项目、会话、回合与工具审批交互为参照。浏览器工作台支持从模糊需求、多轮澄清、PRD/SDD，到自动开发、独立审查、测试和打包；也保留 `brown code` 终端入口。底层复用 DeepSeek-Reasonix 的 TypeScript Agent 引擎，并保留 MIT 归因。
 
 在项目目录中启动后，它会读取并搜索你的代码、提出修改方案并以 diff 展示、在运行 shell 命令前征求你的确认、按需运行测试验证，并为每次会话留下简洁的记录。
 
@@ -36,19 +36,68 @@ brown
 npx @brownsweet/siliconcode
 ```
 
+## 浏览器工作台
+
+```bash
+brown serve --port 3000
+# 在源码目录开发时：npm run build && node dist/cli/index.js serve --port 3000
+```
+
+打开 `http://127.0.0.1:3000`，使用终端输出的一次性设置凭据创建个人管理员。
+登录后配置模型、添加服务端项目目录，创建 1.0 需求版本并开始对话。
+PRD/SDD 中的待澄清问题解决后，确认当前修订，再授权修改文件及列出的测试/打包命令。
+开发中的其他命令逐次审批；执行记录包含审查结论、真实退出码和代码 diff。
+后续从已确认版本创建 2.0，上一版文档保持不变。
+
+自动开发要求项目是已有提交的 Git 仓库。它直接编辑所选目录，保留已有修改并展示开发前基线，
+不会自动提交、推送或部署。账户为个人管理员模式，命令以服务所在系统账户执行。
+使用说明、重启恢复、远程 HTTPS 部署和验证边界见 [浏览器工作台说明](docs/WORKBENCH.md)。
+
+## Docker 启动已有 Dashboard
+
+在源码目录执行（需要 Docker Compose）：
+
+```bash
+docker compose up -d --build
+docker compose logs --tail=30 siliconcode
+```
+
+在宿主机浏览器打开日志中的 `http://localhost:3100/?token=...` 完整地址。
+首次填写 DeepSeek API Key 后自动进入完整面板；配置和会话保存在 Docker 数据卷中。
+默认挂载当前项目，面板中的文件修改会同步到宿主机。默认端口只允许本机访问。
+
+更换项目、远程访问、自动交付与停止/升级操作见 [Docker 使用说明](docs/DOCKER.md)。
+
 ## 常用命令
 
 | 命令 | 用途 |
 | --- | --- |
 | `brown` | 在当前项目目录启动编码智能体（等同 `brown code`）。 |
+| `brown serve` | 启动不依赖终端 TUI 的浏览器开发工作台。 |
 | `brown code [dir]` | 在指定目录 `[dir]` 启动编码智能体；省略 `[dir]` 即为当前目录。 |
 | `brown chat` | 不带文件系统和 shell 工具的纯聊天。 |
 | `brown run "task"` | 非交互式执行一次任务。 |
+| `brown delivery create "需求"` | 创建可恢复的需求到生产交付流程。 |
+| `brown delivery run <id> --yolo` | 在隔离工作区自动开发、验证和审计，运行到下一人工门禁。 |
 | `brown init [dir]` | 分析项目并生成 `SILICON.md` 项目指南。 |
 | `brown doctor` | 本地环境健康检查。 |
 | `brown update` | 检查并安装最新 CLI 包。 |
 
 Silicon Code 也安装 `brown`。默认不会安装 `cc`，因为这个名字通常是系统 C 编译器。
+
+### 自动交付循环
+
+Silicon Code 可以通过 CLI 或随 `brown code` 启动的本地 Web Dashboard 自动写代码。完整流程会持久化 PRD/SDD/验收标准，创建独立 Git worktree，执行开发、有限重试、四类独立审计、测试环境部署与验证，并在生产发布前停止等待人工批准；灰度或观察失败会进入回滚。
+
+```bash
+brown delivery init-config
+# 编辑 .siliconcode/delivery/config.json，替换全部 REPLACE_WITH_* 命令
+brown delivery config
+brown delivery create "实现……" --title "功能名称"
+brown delivery run <run-id> --yolo
+```
+
+`--yolo` 只授权无人值守的文件修改和 shell 命令，不会授权生产发布。生产仍须执行 `brown delivery approve-production <run-id> --actor <姓名>` 或在 Dashboard 中由人批准。设计和验收边界见 [自动交付 PRD/SDD](docs/superpowers/specs/2026-09-23-autonomous-delivery.md)。
 
 ## 配置
 
@@ -66,9 +115,13 @@ export DEEPSEEK_API_KEY=sk-...
 
 项目规则建议写在仓库里的 `AGENTS.md` 或 `SILICON.md`。
 
-模型预设使用当前 DeepSeek V4 API ID：`flash` 对应 `deepseek-v4-flash`，
+模型预设使用官方推荐 API ID：`flash` 对应 `deepseek-flash`，
 `pro` 对应 `deepseek-v4-pro`，`auto` 默认从 Flash 开始，并在困难回合一次性升级
 到 Pro。
+
+2026-10-03 核对官方文档：Flash 推荐名称是 `deepseek-flash`；旧名称仍可调用，
+由 V4.1-Flash 提供服务。工作台可直接填写新名称，费用估算按官方高峰价格保守计算，
+不代表实际账单；低峰价格更低。来源：[DeepSeek 模型与价格](https://api-docs.deepseek.com/quick_start/pricing/)。
 
 桌面端也支持标准 OpenAI 兼容提供方。在“设置 -> 模型 -> 添加模型提供方”中先填写
 Base URL 和 API Key，应用会自动读取 `/models`、推荐模型，并在 Responses API 与

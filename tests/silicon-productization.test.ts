@@ -73,7 +73,7 @@ describe("Silicon broad Reasonix import", () => {
     expect(t("handlers.model.presetAuto")).toContain("预设 → auto");
     expect(t("handlers.model.presetFlash")).toContain("预设 → flash");
     expect(t("handlers.model.presetPro")).toContain("预设 → pro");
-    expect(t("handlers.model.presetAuto")).toContain("deepseek-v4-flash");
+    expect(t("handlers.model.presetAuto")).toContain("deepseek-flash");
     expect(t("handlers.model.presetAuto")).toContain("deepseek-v4-pro");
   });
 
@@ -161,9 +161,9 @@ describe("Silicon broad Reasonix import", () => {
     const en = readFileSync(resolve("src/i18n/EN.ts"), "utf8");
     const zh = readFileSync(resolve("src/i18n/zh-CN.ts"), "utf8");
 
-    expect(en).toContain("coding system prompt, deepseek-v4-flash baseline.");
+    expect(en).toContain("coding system prompt, deepseek-flash baseline.");
     expect(en).not.toContain("coding system prompt, v4-flash baseline.");
-    expect(zh).toContain("编码系统提示词，deepseek-v4-flash 基线。");
+    expect(zh).toContain("编码系统提示词，deepseek-flash 基线。");
     expect(zh).not.toContain("编码系统提示词，v4-flash 基线。");
   });
 

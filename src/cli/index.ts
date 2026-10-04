@@ -364,6 +364,150 @@ program
   });
 
 program
+  .command("serve")
+  .description("启动独立浏览器工作台：账户、项目、需求版本与自动开发")
+  .option("--host <host>", "监听地址", "127.0.0.1")
+  .option("--port <port>", "HTTP 端口", "3000")
+  .option("--data-dir <dir>", "账户、项目与需求数据目录")
+  .option("--config-path <path>", "模型配置文件（默认沿用 CLI 配置）")
+  .option("--origin <url>", "HTTPS 反向代理的外部地址（远程访问必填）")
+  .action(async (opts) => {
+    const { serveCommand } = await import("./commands/serve.js");
+    await serveCommand(opts);
+  });
+
+program
+  .command("workbench-restore <archive>")
+  .description("校验工作台备份并恢复到空数据目录，不覆盖现有记录")
+  .requiredOption("--data-dir <dir>", "新的空数据目录")
+  .action(async (archive, opts) => {
+    const { workbenchRestoreCommand } = await import("./commands/workbench-restore.js");
+    await workbenchRestoreCommand(archive, opts);
+  });
+
+const delivery = program
+  .command("delivery")
+  .description("durable requirement-to-production delivery workflow");
+
+delivery
+  .command("init-config")
+  .description("create the explicit validation/deploy/health/canary/rollback command template")
+  .option("--force", "replace an existing delivery config")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts) => {
+    const { deliveryInitConfigCommand } = await import("./commands/delivery.js");
+    deliveryInitConfigCommand(opts);
+  });
+
+delivery
+  .command("config")
+  .description("validate and print the delivery automation configuration")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts) => {
+    const { deliveryConfigCommand } = await import("./commands/delivery.js");
+    deliveryConfigCommand(opts);
+  });
+
+delivery
+  .command("create <requirement>")
+  .description("create a delivery run; prd-agent turns the requirement into PRD/SDD next")
+  .option("--title <title>", "short delivery title")
+  .option("--id <id>", "stable lowercase kebab-case run id")
+  .option("--max-debug-retries <n>", "bounded validation/audit retries", (value) =>
+    Number.parseInt(value, 10),
+  )
+  .option("--max-iterations <n>", "maximum delivery iterations", (value) =>
+    Number.parseInt(value, 10),
+  )
+  .option("--json", t("ui.jsonHint"))
+  .action(async (requirement: string, opts) => {
+    const { deliveryCreateCommand } = await import("./commands/delivery.js");
+    deliveryCreateCommand({ requirement, ...opts });
+  });
+
+delivery
+  .command("list")
+  .description("list delivery runs in the current workspace")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts) => {
+    const { deliveryListCommand } = await import("./commands/delivery.js");
+    deliveryListCommand(opts);
+  });
+
+delivery
+  .command("status <run-id>")
+  .description("show authoritative stage, gates, evidence summary, and workspace")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (runId: string, opts) => {
+    const { deliveryStatusCommand } = await import("./commands/delivery.js");
+    deliveryStatusCommand({ runId, ...opts });
+  });
+
+delivery
+  .command("workspace <run-id>")
+  .description("create the isolated git branch/worktree after PRD/SDD acceptance")
+  .option("--base <ref>", "base branch/ref (default HEAD)")
+  .option("--actor <name>", "human actor recorded in the audit trail", "user")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (runId: string, opts) => {
+    const { deliveryWorkspaceCommand } = await import("./commands/delivery.js");
+    deliveryWorkspaceCommand({ runId, baseRef: opts.base, ...opts });
+  });
+
+delivery
+  .command("run <run-id>")
+  .description("run the delivery agent headlessly until a human gate, blocker, or terminal state")
+  .option("--yolo", "explicitly authorize unattended file edits and shell commands")
+  .option("--max-turns <n>", "maximum autonomous agent turns", (value) =>
+    Number.parseInt(value, 10),
+  )
+  .option("--budget <usd>", t("ui.budgetHintShort"), (value) => Number.parseFloat(value))
+  .option("--model <id>", t("ui.modelIdHint"))
+  .action(async (runId: string, opts) => {
+    const { deliveryRunCommand } = await import("./commands/delivery-run.js");
+    await deliveryRunCommand({
+      runId,
+      yolo: opts.yolo === true,
+      maxTurns: opts.maxTurns,
+      budgetUsd: parseBudgetFlag(opts.budget),
+      model: opts.model,
+    });
+  });
+
+delivery
+  .command("approve-production <run-id>")
+  .description("human-only production approval; unlocks the canary stage")
+  .requiredOption("--actor <name>", "human approver identity")
+  .option("--comment <text>", "approval comment")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (runId: string, opts) => {
+    const { deliveryApproveCommand } = await import("./commands/delivery.js");
+    deliveryApproveCommand({ runId, ...opts });
+  });
+
+delivery
+  .command("reject-production <run-id>")
+  .description("human-only production rejection")
+  .requiredOption("--actor <name>", "human approver identity")
+  .requiredOption("--comment <text>", "rejection reason")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (runId: string, opts) => {
+    const { deliveryRejectCommand } = await import("./commands/delivery.js");
+    deliveryRejectCommand({ runId, ...opts });
+  });
+
+delivery
+  .command("rollback-complete <run-id>")
+  .description("execute the configured rollback and post-rollback health checks")
+  .requiredOption("--actor <name>", "operator identity")
+  .requiredOption("--summary <text>", "operator note stored with the observed command results")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (runId: string, opts) => {
+    const { deliveryRollbackCompleteCommand } = await import("./commands/delivery.js");
+    await deliveryRollbackCompleteCommand({ runId, ...opts });
+  });
+
+program
   .command("desktop")
   .description("headless JSON-RPC chat for the desktop client (internal)")
   .option("-m, --model <id>", t("ui.modelIdHint"))

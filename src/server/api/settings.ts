@@ -9,7 +9,7 @@ import {
   saveEditMode,
   writeConfig,
 } from "../../config.js";
-import { getLanguage, getSupportedLanguages, setLanguage } from "../../i18n/index.js";
+import { getLanguage, getSupportedLanguages, setLanguageRuntime } from "../../i18n/index.js";
 import type { LanguageCode } from "../../i18n/types.js";
 import type { DashboardContext } from "../context.js";
 import type { ApiResult } from "../router.js";
@@ -219,7 +219,7 @@ export async function handleSettings(
       // prevents an i18n change from being visible while the on-disk
       // value still reflects the old setting (and vice-versa for
       // preset / reasoningEffort).
-      if (langPending) setLanguage(langPending);
+      if (langPending) setLanguageRuntime(langPending);
       if (presetPendingLive) ctx.applyPresetLive?.(presetPendingLive);
       if (effortPendingLive) ctx.applyEffortLive?.(effortPendingLive);
       if (modelPendingLive) ctx.applyModelLive?.(modelPendingLive);
