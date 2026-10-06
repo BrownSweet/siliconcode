@@ -11,7 +11,7 @@ RUN SILICONCODE_BASE_PATH=${SILICONCODE_BASE_PATH} npm run build
 FROM node:22.23.2-trixie-slim AS runtime
 ARG SILICONCODE_BASE_PATH
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git openssh-client ca-certificates curl ripgrep python3 make g++ util-linux \
+    git openssh-client ca-certificates curl ripgrep python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/siliconcode
 COPY --from=build /app/dist ./dist

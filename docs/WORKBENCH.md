@@ -202,3 +202,10 @@ delivery 依据当前迭代、阶段关联的证据分别展示验收、审批�
 - 实际预览子进程验证退出码、输出、停止、服务退出及 POSIX 包装进程退出后的子进程清理。
 - 安装包检查、Git 检查点及公开发布前提见 [发布准备](RELEASE-READINESS.md)。
 - 本轮未做真实浏览器人工检查或模型付费推理；远程三平台 CI 尚待配置 remote 后运行。
+
+## Docker 启动
+
+Docker 默认入口同样为 `brown serve`。通过 `SILICONCODE_WORKBENCH_ORIGIN` 设置外部 HTTPS 地址，
+在容器日志中读取首次管理员设置凭据，登录后打开挂载目录 `/workspace/project`。
+账号、项目与需求版本保存在 `/home/node/.siliconcode/workbench`，随状态数据卷持久化。
+构建、旧面板升级、代理与验收步骤见 [Docker 开发工作台](DOCKER.md)。

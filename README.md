@@ -61,6 +61,7 @@ PRD/SDD 中的待澄清问题解决后，确认当前修订，再授权修改文
 docker build --build-arg SILICONCODE_BASE_PATH=/siliconcode/ -t siliconcode:local .
 docker run -d --name siliconcode --init --restart unless-stopped \
   -p 3100:3100 \
+  -e SILICONCODE_WORKBENCH_ORIGIN=https://tec.zhiquant.com \
   --mount "type=bind,source=$PWD,target=/workspace/project" \
   -v siliconcode-state:/home/node/.siliconcode \
   -v siliconcode-worktrees:/workspace/.siliconcode-worktrees \
@@ -69,9 +70,10 @@ docker run -d --name siliconcode --init --restart unless-stopped \
 docker logs --tail=30 siliconcode
 ```
 
-打开日志中的 `http://localhost:3100/siliconcode/?token=...` 完整地址；远程访问将主机换成服务器 IP。
-通过外部 Nginx 访问时使用 `https://tec.zhiquant.com/siliconcode/?token=...`，上游为容器的 3100 端口，保留 `/siliconcode/` 前缀。
-首次填写 DeepSeek API Key 后进入面板；配置和会话保存在命名数据卷中。
+Docker 默认启动新的 `brown serve` 开发工作台，与本机工作台使用同一界面。
+通过 HTTPS 代理打开 `https://tec.zhiquant.com/siliconcode/`；将环境变量中的域名换成实际域名（不含路径），Nginx 保留 Host 和 `/siliconcode/` 前缀。
+首次使用日志中的一次性设置凭据创建管理员，再登录配置模型、打开 `/workspace/project`。无需 URL token；账号、项目、需求版本和模型配置保存在数据卷中，重启后重新登录。
+旧版用户需要重建镜像和容器并增加上述环境变量，复用原数据卷；旧聊天与 delivery 记录保留，但不会自动转换为新工作台任务。
 上述命令挂载当前项目，面板修改会同步到宿主机；3100 端口只应允许外部代理访问。
 
 项目目录、容器网络、Nginx 配置、持久化与升级步骤见 [Docker 使用说明](docs/DOCKER.md)。
