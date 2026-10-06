@@ -1,122 +1,163 @@
-# Docker 启动与浏览器使用
+# Dockerfile 构建与启动
 
-## 1. 启动
+使用一个 Dockerfile 构建包含前端与后端的镜像，再通过 `docker run` 启动单个容器。
+宿主机只需安装 Docker，无需安装 Node.js 或 Compose。容器内的 Node HTTP 服务同时提供页面、API 和 SSE。
 
-安装并启动 Docker（包含 Compose），在本仓库目录执行：
+## 1. 构建镜像
+
+进入服务器上的 Silicon Code 源码目录执行：
 
 ```bash
-docker compose up -d --build
-docker compose logs --tail=30 siliconcode
+docker build \
+  --build-arg SILICONCODE_BASE_PATH=/siliconcode/ \
+  -t siliconcode:local .
 ```
 
-在**宿主机浏览器**打开日志给出的完整地址：
+Dockerfile 默认前缀也是 `/siliconcode/`。前端构建、首次配置页、静态资源、API、SSE 和健康检查均使用该前缀。
+根路径部署可将构建参数改成 `/`，然后重建镜像和容器。普通 `npm run build` 默认仍是 `/`。
+
+## 2. 启动单个容器
+
+继续在源码目录执行，以下命令将**当前目录作为智能体操作的项目**：
+
+```bash
+docker run -d \
+  --name siliconcode \
+  --init \
+  --restart unless-stopped \
+  -p 3100:3100 \
+  --mount "type=bind,source=$PWD,target=/workspace/project" \
+  -v siliconcode-state:/home/node/.siliconcode \
+  -v siliconcode-worktrees:/workspace/.siliconcode-worktrees \
+  -v siliconcode-node-modules:/workspace/project/node_modules \
+  siliconcode:local
+
+docker logs --tail=30 siliconcode
+```
+
+要让智能体操作其他项目，把 `source=$PWD` 换成该项目在服务器上的真实绝对路径；目录必须已存在。
+面板中的文件修改会同步到这个宿主机目录。Linux 宿主机需要确保容器 `node` 用户（UID 1000）对目标目录有读写权限；镜像不会递归修改宿主机项目权限。
+
+这里的 `-p 3100:3100` 对应外部 Nginx 通过 `43.155.214.55:3100` 访问的部署方式，将该端口的防火墙来源限制为代理机器。
+仅本机访问时改为 `-p 127.0.0.1:3100:3100`。同一 Docker 网络内访问的方式见下一节。
+
+日志会给出带令牌的地址，例如：
 
 ```text
-http://localhost:3100/?token=日志中的访问令牌
+http://localhost:3100/siliconcode/?token=日志中的访问令牌
 ```
 
-首次启动显示中文配置页。填写 DeepSeek API Key，点击“保存并打开面板”，等待完整面板启动。
-Key 存放在 `siliconcode-state` 数据卷内的 `config.json`（文件权限 0600），不会写进镜像。
-令牌也会持久化；不要将完整链接公开分享。配置页仅保存 Key，不验证服务商余额或 Key 有效性，真实调用时才会返回服务商错误。
+直接访问服务器时将 `localhost` 换成服务器 IP；通过域名访问则使用：
 
-也可以在启动前设置 `DEEPSEEK_API_KEY` 环境变量，跳过配置页；使用环境变量时，能访问 Docker 的用户可以从容器配置中读取它。
+```text
+https://tec.zhiquant.com/siliconcode/?token=日志中的访问令牌
+```
 
-## 2. 在面板中使用
+首次启动填写 DeepSeek API Key 后进入完整面板。Key 和访问令牌保存在 `siliconcode-state` 数据卷中，配置文件权限为 0600，不会写进镜像。
+配置页只保存 Key，不验证服务商余额或 Key 有效性。持有令牌的人可以操作挂载项目，不要公开完整访问链接。
 
-- **聊天/编码**：输入需求，例如“先分析这个项目，列出实现登录功能的方案，暂时不要改代码”。随后授权修改，并在面板中处理命令审批、查看结果。
-- **自动交付（Delivery）**：切换到自动交付页（若未展示，打开高级面板列表），新建需求，勾选无人值守文件修改和命令执行授权，然后运行到下一门禁。按页面提示创建独立工作区、处理审批。
-- **部署配置**：实际测试/构建/部署/回滚命令必须按项目配置；镜像不会猜测你的生产服务器，也不会自动获得生产权限。
+也可以在 `docker run` 的镜像名之前加入 `-e DEEPSEEK_API_KEY`，将当前终端的同名环境变量传入容器以跳过配置页；能访问 Docker 的用户可以读取容器环境变量。
+需要固定面板令牌时，可加入 `-e SILICONCODE_DASHBOARD_TOKEN`，值须为 16–128 位英文字母或数字；默认自动生成并持久化。
+`docker run` 不会自动读取当前目录的 `.env`；如需从文件传参，显式使用 `--env-file /实际路径/siliconcode.env`。
 
-首次使用交付循环，在终端执行：
+## 3. 外部 Nginx 配置
+
+在现有 HTTPS `server` 中加入，并沿用已有代理头、600 秒超时和 `proxy_buffering off`：
+
+```nginx
+location = /siliconcode {
+    return 308 /siliconcode/$is_args$args;
+}
+
+location ^~ /siliconcode/ {
+    proxy_pass http://43.155.214.55:3100;
+}
+```
+
+**`proxy_pass` 末尾不要加 `/`**，容器需要收到完整 `/siliconcode/` 前缀。
+完整三项目样例见 [`docker/host-nginx.conf.example`](../docker/host-nginx.conf.example)。
+样例的 `/lawer/` 沿用原 `/a/` 的 8088 上游端口，须确认 Lawer 已自行支持 `/lawer/`。
+本次不修改 Jiami 或 Lawer 项目，也不替换服务器上的 Nginx 配置。
+
+用样例替换原同域名配置后，在外部 Nginx 容器中运行（将 `你的nginx容器名` 换成实际名称）：
 
 ```bash
-docker compose exec siliconcode brown delivery init-config
+docker exec 你的nginx容器名 nginx -t
+# 仅在检查通过后执行
+docker exec 你的nginx容器名 nginx -s reload
 ```
 
-编辑宿主机项目中的 `.siliconcode/delivery/config.json`，将所有 `REPLACE_WITH_*` 占位命令替换为真实命令，然后检查：
+外部 Nginx 和 Silicon Code 位于同一 Docker 宿主机时，也可以沿用 Jiami 的容器网络方式：
+将上面的 `-p 3100:3100` 替换为 `--network 已存在的代理网络名`，并确保 Nginx 容器已加入该网络。
+Nginx 上游改为 `proxy_pass http://siliconcode:3100;`，无需发布宿主机端口。
+代理容器内的 `127.0.0.1` 指向代理自身，不能用来访问 Silicon Code 容器。
 
-```bash
-docker compose exec siliconcode brown delivery config
-```
-
-交付循环有重试和轮次限制，不是无限自改循环；生产发布必须由人批准。容器重启保留交付状态，但不会自动重新执行中断的任务，应查看状态后恢复。
-
-镜像包含 Node.js 22、npm、Git、SSH 客户端、curl、ripgrep、Python 3 和 C/C++ 基础构建工具。
-**目标项目依赖不是 Silicon Code 镜像依赖**，需要自行安装。例如 Node 项目：
-
-```bash
-docker compose exec siliconcode npm ci --include=dev
-```
-
-容器没有 Docker CLI/宿主机 Docker socket，也没有浏览器测试运行时或生产凭据；需要这些能力时应显式扩展镜像/配置，不要假设部署命令必定可用。不要随意挂载 Docker socket，它会大幅扩大容器权限。
-
-## 3. 项目与持久化
-
-默认挂载当前仓库：
+## 4. 持久化与升级
 
 | 数据 | 容器路径 | 保存位置 |
 | --- | --- | --- |
-| 目标项目 | `/workspace/project` | 宿主机绑定目录，修改实时同步 |
-| API Key、用户配置、会话、面板令牌 | `/home/node/.siliconcode` | `siliconcode-state` 数据卷 |
-| 交付独立 Git worktree | `/workspace/.siliconcode-worktrees` | `siliconcode-worktrees` 数据卷 |
-| 主项目 Linux Node 依赖 | `/workspace/project/node_modules` | `siliconcode-node-modules` 数据卷，避免混用宿主机依赖 |
+| 目标项目、项目级配置和交付状态 | `/workspace/project` | `--mount` 指定的宿主机目录 |
+| API Key、用户配置、会话、面板令牌 | `/home/node/.siliconcode` | `siliconcode-state` 命名数据卷 |
+| 交付独立 Git worktree | `/workspace/.siliconcode-worktrees` | `siliconcode-worktrees` 命名数据卷 |
+| 主项目 Linux Node 依赖 | `/workspace/project/node_modules` | `siliconcode-node-modules` 命名数据卷 |
 
-数据卷名称会带 Compose 项目前缀。交付状态与项目级配置保存在目标项目的 `.siliconcode/delivery` 下。独立 worktree 需要自己的依赖安装步骤，不能假设复用主项目的 `node_modules`。
-
-要操作另一个项目，请在 Silicon Code 源码目录执行（替换为真实绝对路径；目标目录须存在）：
+命名数据卷首次运行时由 Docker 创建。更新源码后，在源码目录重新构建，成功后再替换旧容器：
 
 ```bash
-SILICONCODE_PROJECT_DIR=/absolute/path/to/your-project \
-SILICONCODE_HTTP_PORT=3101 \
-docker compose -p my-project up -d --build
-docker compose -p my-project logs --tail=30 siliconcode
+docker build --build-arg SILICONCODE_BASE_PATH=/siliconcode/ -t siliconcode:local .
+# 构建成功后执行
+docker stop siliconcode
+docker rm siliconcode
+# 再执行第 2 节的 docker run，复用原项目路径和三个数据卷名称。
 ```
 
-此时使用 `http://localhost:3101/?token=...`。后续该实例的命令也要保持同样的环境变量和 `-p my-project`，可在本地 `.env` 保存这些值。每个不同项目建议使用独立 Compose 项目名隔离状态和依赖卷。
+删除容器不会删除这些命名数据卷；不要删除数据卷。`docker restart` 不会更新镜像、挂载或端口映射。
+更换项目或同时运行多个实例时，使用不同的容器名、宿主机端口、项目目录和三组数据卷，避免混用状态。
+如果此前已使用 Compose 部署，先用 `docker inspect 旧容器名 --format '{{json .Mounts}}'` 查出实际卷名（通常带项目前缀），在 `docker run` 中复用这些卷名；直接使用新的卷名会表现为全新实例。
 
-交付 worktree 需要真实 Git 仓库和有效的 `HEAD`。容器内生成的 worktree 路径属于容器，不应直接从宿主机执行其中的 Git 操作。
-镜像以 `node` 用户（UID 1000）运行。Linux 宿主机须确保目标项目允许 UID 1000 读写；本方案不会自动递归修改你的项目权限。自动提交前也需在目标仓库设置 Git 作者身份。
-
-## 4. 远程服务器访问
-
-默认只绑定宿主机 `127.0.0.1:3100`。远程服务器推荐通过 SSH 隧道访问：
+## 5. 管理和使用
 
 ```bash
-ssh -L 3100:127.0.0.1:3100 user@server
-```
-
-随后在本地浏览器使用日志里的 `http://localhost:3100/?token=...`。
-
-如需局域网直接访问，在服务器启动时指定：
-
-```bash
-SILICONCODE_BIND_ADDRESS=0.0.0.0 docker compose up -d
-```
-
-浏览器使用 `http://服务器IP:3100/?token=...`，并限制防火墙来源。不要把当前 HTTP 面板直接暴露在公网；公网使用应增加 HTTPS 反向代理与额外访问控制。持有令牌的人可以操作挂载的项目。
-
-## 5. 常用管理命令
-
-```bash
-# 状态（healthy 同样可能表示首次配置页已就绪）
-docker compose ps
+# 状态与健康检查（healthy 也可能表示首次配置页已就绪）
+docker ps --filter name=siliconcode
+docker inspect --format '{{.State.Health.Status}}' siliconcode
 
 # 日志 / 找回访问链接
-docker compose logs --tail=30 siliconcode
+docker logs --tail=30 siliconcode
 
-# 重启
-docker compose restart siliconcode
-
-# 停止并移除容器，保留命名数据卷
-docker compose down
-
-# 源码更新后重建并启动；容器内自动更新已禁用
-docker compose up -d --build
+# 重启 / 停止 / 启动已有容器
+docker restart siliconcode
+docker stop siliconcode
+docker start siliconcode
 
 # 容器内命令行
-docker compose exec siliconcode brown --help
+docker exec -it siliconcode brown --help
+
+# 目标 Node 项目需要依赖时，自行安装
+docker exec -it siliconcode npm ci --include=dev
+
+# 初始化并检查自动交付配置
+docker exec -it siliconcode brown delivery init-config
+docker exec -it siliconcode brown delivery config
 ```
 
-不要使用 `docker compose down -v`，除非确定要删除配置、会话、独立 worktree 和依赖卷。Key 或挂载项目的权限错误可以先查看日志排查。
+容器默认运行已有的附属 Dashboard（`brown code`），首次配置后可在页面聊天、编码和处理审批。
+独立 `brown serve` 工作台也支持子路径，但未替换本镜像的默认入口。
+交付 worktree 需要真实 Git 仓库和有效的 `HEAD`；自动提交前需配置 Git 作者身份。
+将项目 `.siliconcode/delivery/config.json` 中的 `REPLACE_WITH_*` 替换为真实验证和部署命令。
+交付循环有重试及轮次限制，生产发布需人批准；重启后不会自动重新执行中断任务。
 
-可选环境变量：`SILICONCODE_HTTP_PORT`（默认 3100）、`SILICONCODE_BIND_ADDRESS`（默认 127.0.0.1）、`SILICONCODE_PROJECT_DIR`（默认当前仓库）、`DEEPSEEK_API_KEY`、`SILICONCODE_DASHBOARD_TOKEN`（16–128 位英文字母或数字；默认随机生成并持久化）。
+镜像包含 Node.js 22、npm、Git、SSH 客户端、curl、ripgrep、Python 3 和 C/C++ 基础构建工具。
+目标项目依赖需要单独安装；独立 worktree 也需要自己的依赖。
+镜像不包含 Docker CLI、宿主机 Docker socket、浏览器测试运行时或生产凭据。
+
+## 6. 验证镜像
+
+开发环境安装 Node.js 22 或更高版本时，构建后执行：
+
+```bash
+node docker/smoke-test.mjs
+```
+
+测试通过 `docker run` 启动隔离临时容器，验证子路径、配置页、鉴权、静态资源、SSE、健康检查、重启及复用挂载重建容器后的数据持久化。
+测试使用假 Key，不调用模型，不操作真实项目，结束后清理临时容器和测试卷。

@@ -1,3 +1,4 @@
+import { appUrl } from "../lib/base-path.js";
 import hljs from "highlight.js/lib/common";
 import htm from "htm";
 import { h } from "preact";
@@ -1607,7 +1608,7 @@ function ChatPane(props: ChatPaneProps) {
   }, [cancelStreamingRaf]);
 
   useEffect(() => {
-    const es = new EventSource(`/api/events?token=${TOKEN}`);
+    const es = new EventSource(appUrl(`/api/events?token=${TOKEN}`));
     let firstOpen = true;
     es.onopen = () => {
       if (firstOpen) {

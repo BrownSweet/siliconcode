@@ -5,6 +5,7 @@ import { type IncomingMessage, type ServerResponse, createServer } from "node:ht
 import type { AddressInfo } from "node:net";
 import { handleEvents } from "./api/events.js";
 import { renderIndexHtml, serveAsset } from "./assets.js";
+import { getBasePath, routeUnderBase } from "./base-path.js";
 import type { DashboardContext } from "./context.js";
 import { handleApi } from "./router.js";
 
@@ -112,9 +113,11 @@ export async function dispatch(
   res: ServerResponse,
   ctx: DashboardContext,
   expectedToken: string,
+  basePath = getBasePath(),
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
-  const path = url.pathname;
+  const path = routeUnderBase(url, res, basePath);
+  if (path === null) return;
   const method = (req.method ?? "GET").toUpperCase();
   const isMutation = method === "POST" || method === "DELETE" || method === "PUT";
 
@@ -128,7 +131,7 @@ export async function dispatch(
       res.end("unauthorized - open the URL printed by /dashboard, including ?token=...");
       return;
     }
-    const html = renderIndexHtml(expectedToken, ctx.mode);
+    const html = renderIndexHtml(expectedToken, ctx.mode, basePath);
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(html);
     return;
@@ -203,10 +206,11 @@ export function startDashboardServer(
   const token = opts.token ?? mintToken();
   const host = opts.host ?? "127.0.0.1";
   const port = opts.port ?? 0;
+  const basePath = getBasePath();
 
   return new Promise((resolve, reject) => {
     const server = createServer((req, res) => {
-      dispatch(req, res, ctx, token).catch((err) => {
+      dispatch(req, res, ctx, token, basePath).catch((err) => {
         if (!res.headersSent) {
           res.writeHead(500, { "content-type": "application/json" });
         }
@@ -217,7 +221,7 @@ export function startDashboardServer(
     server.listen(port, host, () => {
       const addr = server.address() as AddressInfo;
       const finalPort = addr.port;
-      const url = `http://${host}:${finalPort}/?token=${token}`;
+      const url = `http://${host}:${finalPort}${basePath}?token=${token}`;
       if (!LOOPBACK_HOSTS.has(host)) {
         process.stderr.write(
           `WARNING: Dashboard bound to ${host}:${finalPort} (non-loopback). The URL token is the only auth; keep it secret.\n`,

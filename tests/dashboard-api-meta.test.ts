@@ -28,6 +28,25 @@ describe("dashboard API meta tags", () => {
     globalThis.document = originalDocument;
   });
 
+  it("sends browser API requests under the server-provided mount", async () => {
+    vi.resetModules();
+    installDocumentMeta({
+      "siliconcode-base-path": "/siliconcode/",
+      "siliconcode-token": "test-token",
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response('{"ok":true}'));
+    try {
+      const { api } = await import("../dashboard/src/lib/api.js");
+      await api("/settings");
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/siliconcode/api/settings?token=test-token",
+        expect.any(Object),
+      );
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("prefers Silicon meta tags for token and mode", async () => {
     await expect(
       loadApiMeta({

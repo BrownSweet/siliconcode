@@ -1,0 +1,65 @@
+# 由 nginx.conf 的 http {} include 加载；替换同域名旧配置，避免重复 server。
+# Silicon Code 默认镜像接收 /siliconcode/，容器端口为 3100。
+# Lawer 的 8088 端口沿用原 /a/ 上游；须确认 Lawer 已支持 /lawer/。
+map $http_upgrade $projects_connection_upgrade {
+    default upgrade;
+    "" close;
+}
+
+server {
+    listen 80;
+    server_name tec.zhiquant.com;
+    access_log /var/log/nginx/tec.zhiquant.com.http.access.log combined;
+    error_log /var/log/nginx/tec.zhiquant.com.http.error.log warn;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name tec.zhiquant.com;
+    access_log /var/log/nginx/tec.zhiquant.com.https.access.log combined;
+    error_log /var/log/nginx/tec.zhiquant.com.https.error.log warn;
+
+    ssl_certificate /etc/nginx/ssl/tec.zhiquant.com.pem;
+    ssl_certificate_key /etc/nginx/ssl/tec.zhiquant.com.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options nosniff;
+    add_header X-Frame-Options SAMEORIGIN;
+    client_max_body_size 50M;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $projects_connection_upgrade;
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+    proxy_buffering off;
+
+    location = /jiami {
+        return 308 /jiami/$is_args$args;
+    }
+    location ^~ /jiami/ {
+        proxy_pass http://43.155.214.55:8081;
+    }
+    location = /lawer {
+        return 308 /lawer/$is_args$args;
+    }
+    location ^~ /lawer/ {
+        proxy_pass http://43.155.214.55:8088;
+    }
+    location = /siliconcode {
+        return 308 /siliconcode/$is_args$args;
+    }
+    location ^~ /siliconcode/ {
+        # 不加末尾 /，保留前缀。同一 Docker 网络可改用 http://siliconcode:3100。
+        proxy_pass http://43.155.214.55:3100;
+    }
+    location / {
+        return 404;
+    }
+}

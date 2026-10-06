@@ -12,6 +12,7 @@ import {
 } from "../config.js";
 import { probeOpenAICompatibleProvider } from "../provider-probe.js";
 import { serveWorkbenchAsset } from "../server/assets.js";
+import { getBasePath, routeUnderBase } from "../server/base-path.js";
 import { readBody } from "../server/index.js";
 import { WorkbenchAuth } from "./auth.js";
 import { exportWorkbench } from "./backup.js";
@@ -85,6 +86,7 @@ export interface WorkbenchServerOptions extends RuntimeOptions {
 }
 
 export async function startWorkbenchServer(options: WorkbenchServerOptions) {
+  const basePath = getBasePath();
   const host = options.host ?? "127.0.0.1";
   if (!loopback.has(host) && (!options.origin || new URL(options.origin).protocol !== "https:")) {
     throw new Error("远程访问需要 HTTPS 反向代理，并通过 --origin 指定外部 HTTPS 地址");
@@ -160,10 +162,10 @@ export async function startWorkbenchServer(options: WorkbenchServerOptions) {
     const mutation = !["GET", "HEAD"].includes(method);
     if (mutation && req.headers.origin && req.headers.origin !== origin)
       throw new WorkbenchError(403, "跨站请求被拒绝");
-    if (url.pathname === "/" || url.pathname.startsWith("/assets/")) {
-      const asset = serveWorkbenchAsset(
-        url.pathname === "/" ? "index.html" : url.pathname.slice(8),
-      );
+    const path = routeUnderBase(url, res, basePath);
+    if (path === null) return;
+    if (path === "/" || path.startsWith("/assets/")) {
+      const asset = serveWorkbenchAsset(path === "/" ? "index.html" : path.slice(8), basePath);
       if (!asset || method !== "GET") throw new WorkbenchError(404, "资源不存在");
       res.writeHead(200, { "content-type": asset.contentType });
       res.end(asset.body);
@@ -179,7 +181,6 @@ export async function startWorkbenchServer(options: WorkbenchServerOptions) {
         throw new WorkbenchError(400, "无效或过大的 JSON 请求");
       }
     }
-    const path = url.pathname;
     if (path === "/api/auth/status" && method === "GET") {
       json(res, 200, { needsSetup: auth.needsSetup });
       return;
@@ -199,7 +200,7 @@ export async function startWorkbenchServer(options: WorkbenchServerOptions) {
       );
       res.setHeader(
         "set-cookie",
-        `${cookieName}=${login.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${origin.startsWith("https:") ? "; Secure" : ""}`,
+        `${cookieName}=${login.token}; HttpOnly; SameSite=Strict; Path=${basePath}; Max-Age=43200${origin.startsWith("https:") ? "; Secure" : ""}`,
       );
       json(res, 200, login.session);
       return;
@@ -271,7 +272,10 @@ export async function startWorkbenchServer(options: WorkbenchServerOptions) {
     }
     if (path === "/api/auth/logout" && method === "POST") {
       auth.logout(token(req));
-      res.setHeader("set-cookie", `${cookieName}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
+      res.setHeader(
+        "set-cookie",
+        `${cookieName}=; HttpOnly; SameSite=Strict; Path=${basePath}; Max-Age=0`,
+      );
       json(res, 200, { ok: true });
       return;
     }
@@ -516,7 +520,7 @@ export async function startWorkbenchServer(options: WorkbenchServerOptions) {
   }
   let closing: Promise<void> | undefined;
   return {
-    url: origin,
+    url: basePath === "/" ? origin : `${origin}${basePath.slice(0, -1)}`,
     auth,
     runtime,
     previews,

@@ -1,6 +1,9 @@
 services:
   siliconcode:
-    build: .
+    build:
+      context: .
+      args:
+        SILICONCODE_BASE_PATH: ${SILICONCODE_BASE_PATH:-/siliconcode/}
     image: siliconcode:local
     init: true
     restart: unless-stopped

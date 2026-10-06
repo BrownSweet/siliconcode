@@ -5,6 +5,11 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+const configuredBase = process.env.SILICONCODE_BASE_PATH?.trim() || "/";
+if (!/^(?:\/[A-Za-z0-9_-]+)*\/?$/.test(configuredBase)) throw new Error("Invalid SILICONCODE_BASE_PATH");
+const basePath = configuredBase.endsWith("/") ? configuredBase : `${configuredBase}/`;
+process.env.SILICONCODE_BASE_PATH = basePath;
+
 const stateDir = join(homedir(), ".siliconcode");
 mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 const configPath = join(stateDir, "config.json");
@@ -33,7 +38,7 @@ function saveConfig(config) {
 
 const config = readConfig();
 saveConfig({ lang: "zh-CN", ...config, autoUpdate: false });
-console.log(`\nSilicon Code 浏览器地址：http://localhost:${port}/?token=${token}`);
+console.log(`\nSilicon Code 浏览器地址：http://localhost:${port}${basePath}?token=${token}`);
 console.log("远程访问时将 localhost 换为服务器地址；访问端口以 Docker 映射为准。\n");
 
 let child;
@@ -86,7 +91,7 @@ const setupHtml = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta
 <style>body{font-family:system-ui;background:#10131a;color:#e5e7eb;max-width:560px;margin:10vh auto;padding:24px}input,button{box-sizing:border-box;width:100%;padding:14px;margin:12px 0;border-radius:8px;border:1px solid #536078}input{background:#1b2230;color:white}button{background:#87bfff;color:#10131a;cursor:pointer}p{line-height:1.7;color:#b6c0d0}#error{color:#fca5a5}</style>
 <h1>Silicon Code</h1><p>容器已启动。填写 DeepSeek API Key 后即可进入编码与自动交付面板。Key 保存在容器的数据卷中。</p>
 <form><label for="key">DeepSeek API Key</label><input id="key" name="key" type="password" autocomplete="off" required placeholder="sk-…"><button>保存并打开面板</button></form><p id="error" role="alert"></p>
-<script>document.querySelector('form').onsubmit=async e=>{e.preventDefault();const button=document.querySelector('button');button.disabled=true;try{const r=await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json','X-Siliconcode-Token':new URLSearchParams(location.search).get('token')},body:JSON.stringify({apiKey:document.querySelector('#key').value})});if(!r.ok)throw new Error((await r.json()).error);document.querySelector('#key').value='';button.textContent='正在启动面板…';const poll=setInterval(async()=>{try{const r=await fetch(location.href);if(r.ok&&(await r.text()).includes('name="siliconcode-token"')){clearInterval(poll);location.reload()}}catch{}},1500)}catch(err){document.querySelector('#error').textContent=err.message;button.disabled=false}};</script></html>`;
+<script>document.querySelector('form').onsubmit=async e=>{e.preventDefault();const button=document.querySelector('button');button.disabled=true;try{const r=await fetch('${basePath}setup',{method:'POST',headers:{'Content-Type':'application/json','X-Siliconcode-Token':new URLSearchParams(location.search).get('token')},body:JSON.stringify({apiKey:document.querySelector('#key').value})});if(!r.ok)throw new Error((await r.json()).error);document.querySelector('#key').value='';button.textContent='正在启动面板…';const poll=setInterval(async()=>{try{const r=await fetch(location.href);if(r.ok&&(await r.text()).includes('name="siliconcode-token"')){clearInterval(poll);location.reload()}}catch{}},1500)}catch(err){document.querySelector('#error').textContent=err.message;button.disabled=false}};</script></html>`;
 
 const activeProvider = config.modelProviders?.find?.(p => p.id === (config.activeModelProviderId || "deepseek"));
 const configuredKey = Array.isArray(config.modelProviders) ? activeProvider?.apiKey : config.apiKey;
@@ -95,15 +100,20 @@ if (process.env.DEEPSEEK_API_KEY?.trim() || configuredKey?.trim()) {
 } else {
   setupServer = createServer(async (req, res) => {
     const url = new URL(req.url || "/", "http://localhost");
+    if (basePath !== "/" && url.pathname === basePath.slice(0, -1)) {
+      res.writeHead(308, { location: `${basePath}${url.search}` }); res.end(); return;
+    }
+    if (!url.pathname.startsWith(basePath)) { res.writeHead(404); res.end("not found"); return; }
+    const path = `/${url.pathname.slice(basePath.length)}`;
     const mutation = req.method === "POST";
     const credential = mutation ? req.headers["x-siliconcode-token"] : url.searchParams.get("token");
     if (!authorized(credential)) { res.writeHead(401); res.end("请使用容器日志中的完整 token 链接访问。"); return; }
-    if (req.method === "GET" && url.pathname === "/") {
+    if (req.method === "GET" && path === "/") {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
       res.end(setupHtml);
       return;
     }
-    if (mutation && url.pathname === "/setup") {
+    if (mutation && path === "/setup") {
       try {
         let body = "";
         for await (const chunk of req) {

@@ -1,6 +1,7 @@
 import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { getBasePath } from "./base-path.js";
 
 /** Resolve dashboard/ across tsx-dev and tsup-bundled layouts. */
 function resolveAssetDir(): string {
@@ -30,10 +31,16 @@ function resolveAssetDir(): string {
 const ASSET_DIR = resolveAssetDir();
 
 /** Public workbench login shell; no credentials are embedded in its assets. */
-export function serveWorkbenchAsset(name: string): { body: string; contentType: string } | null {
+export function serveWorkbenchAsset(
+  name: string,
+  basePath = getBasePath(),
+): { body: string; contentType: string } | null {
   if (name === "index.html")
     return {
-      body: loadCachedFile(join(ASSET_DIR, "workbench.html")),
+      body: loadCachedFile(join(ASSET_DIR, "workbench.html")).replaceAll(
+        "__SILICONCODE_BASE_PATH__",
+        basePath,
+      ),
       contentType: "text/html; charset=utf-8",
     };
   if (name === "workbench.js")
@@ -93,14 +100,19 @@ function loadCss(): string {
 }
 
 /** Token HTML-attribute-escaped in case a future mint produces non-hex bytes. */
-export function renderIndexHtml(token: string, mode: "standalone" | "attached"): string {
+export function renderIndexHtml(
+  token: string,
+  mode: "standalone" | "attached",
+  basePath = getBasePath(),
+): string {
   const tpl = loadIndexTemplate();
   const safeToken = token.replace(/[^a-zA-Z0-9]/g, "");
   // String.replace(string, replacement) only swaps the FIRST match. The template
   // repeats token/mode placeholders across meta, CSS, and script URLs.
   return tpl
     .replaceAll("__SILICONCODE_TOKEN__", safeToken)
-    .replaceAll("__SILICONCODE_MODE__", mode);
+    .replaceAll("__SILICONCODE_MODE__", mode)
+    .replaceAll("__SILICONCODE_BASE_PATH__", basePath);
 }
 
 /** Vendor CSS the bundle pulls from npm and the build script copies into `dashboard/dist/`. */

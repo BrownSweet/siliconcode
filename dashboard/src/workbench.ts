@@ -1,3 +1,4 @@
+import { appUrl } from "./lib/base-path.js";
 import { render } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
@@ -120,7 +121,7 @@ export function App() {
 
   const api = useCallback(
     async (path: string, method = "GET", body?: unknown): Promise<any> => {
-      const res = await fetch(`/api${path}`, {
+      const res = await fetch(appUrl(`/api${path}`), {
         method,
         headers: { "content-type": "application/json", "x-siliconcode-csrf": session?.csrf ?? "" },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -183,8 +184,8 @@ export function App() {
   useEffect(() => {
     void (async () => {
       try {
-        setSetup((await (await fetch("/api/auth/status")).json()).needsSetup);
-        const me = await fetch("/api/auth/me");
+        setSetup((await (await fetch(appUrl("/api/auth/status"))).json()).needsSetup);
+        const me = await fetch(appUrl("/api/auth/me"));
         if (me.ok) setSession(await me.json());
       } catch (err) {
         setError((err as Error).message);
@@ -264,7 +265,7 @@ export function App() {
     let disposed = false;
     setEvents([]);
     setConnected(true);
-    const source = new EventSource(`/api/tasks/${selectedId}/events`);
+    const source = new EventSource(appUrl(`/api/tasks/${selectedId}/events`));
     source.onopen = () => {
       if (!disposed) setConnected(true);
     };
@@ -691,7 +692,7 @@ export function App() {
                 });
               }}><label>估算费用上限（USD）<input name="budget" type="number" min="0.000001" max="100000" step="any" value=${limits.budgetUsd ?? ""} placeholder="留空不限" /></label><label>累计输入与输出 Token 上限<input name="tokens" type="number" min="1" max="1000000000" step="1" value=${limits.maxTokens ?? ""} placeholder="留空不限" /></label><p class="hint">每次模型响应后检查。单次请求可能超过剩余额度，费用仅为估算；设置上限后，用量或价格缺失会停止继续执行。</p><button class="primary" disabled=${pending}>保存运行限制</button></form>`
             : settings === "data"
-              ? html`<h3>工作台备份</h3><p>导出账户登录信息、项目索引、需求、对话、执行记录和运行限制。备份含执行快照，但不包含完整项目目录和模型配置文件。</p><p class="hint">备份包含私人对话与账户密码哈希，请存放在你自己的安全位置。正在执行的任务结束后可导出。</p><a class="primary" href="/api/backup" download="siliconcode-workbench.scwb.gz">下载工作台备份</a><h3>恢复到新数据目录</h3><p>恢复会校验格式、长度与哈希，只写入空目录。</p><pre> brown workbench-restore /path/backup.scwb.gz --data-dir /path/new-data</pre><p>完成后使用 brown serve --data-dir /path/new-data 启动，并用原账户密码登录。</p>`
+              ? html`<h3>工作台备份</h3><p>导出账户登录信息、项目索引、需求、对话、执行记录和运行限制。备份含执行快照，但不包含完整项目目录和模型配置文件。</p><p class="hint">备份包含私人对话与账户密码哈希，请存放在你自己的安全位置。正在执行的任务结束后可导出。</p><a class="primary" href=${appUrl("/api/backup")} download="siliconcode-workbench.scwb.gz">下载工作台备份</a><h3>恢复到新数据目录</h3><p>恢复会校验格式、长度与哈希，只写入空目录。</p><pre> brown workbench-restore /path/backup.scwb.gz --data-dir /path/new-data</pre><p>完成后使用 brown serve --data-dir /path/new-data 启动，并用原账户密码登录。</p>`
               : settings === "appearance"
                 ? html`<h3>让工作台更适合你</h3><p class="muted">外观偏好会保存在此浏览器。</p><div class="theme-options">${["light", "dark"].map((value) => html`<button aria-pressed=${theme === value} onClick=${() => setTheme(value)}><span class=${`theme-preview ${value}`}><i /><b><em /><em /><em /></b></span><span><${Icon} name=${value === "light" ? "sun" : "moon"} size=${17} />${value === "light" ? "浅色" : "深色"}${theme === value && html`<${Icon} name="check" size=${16} />`}</span></button>`)}</div>`
                 : html`<div class="account-summary"><span class="avatar">${session.username.slice(0, 1).toUpperCase()}</span><div><strong>${session.username}</strong><p class="muted">个人管理员</p></div></div><h3>修改密码</h3><form onSubmit=${(

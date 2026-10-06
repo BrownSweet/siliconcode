@@ -1,3 +1,4 @@
+import { appUrl } from "../lib/base-path.js";
 import { memo } from "preact/compat";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import {
@@ -226,7 +227,7 @@ export function ChatPanel() {
   }, [cancelStreamingRaf]);
 
   useEffect(() => {
-    const es = new EventSource(`/api/events?token=${TOKEN}`);
+    const es = new EventSource(appUrl(`/api/events?token=${TOKEN}`));
     let firstOpen = true;
     es.onopen = () => {
       if (firstOpen) {

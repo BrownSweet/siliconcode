@@ -1,3 +1,4 @@
+import { appUrl } from "./base-path.js";
 export const TOKEN: string =
   document.querySelector('meta[name="siliconcode-token"]')?.getAttribute("content") ??
   document.querySelector('meta[name="reasonix-token"]')?.getAttribute("content") ??
@@ -23,7 +24,7 @@ export interface ApiError extends Error {
 
 export async function api<T = unknown>(path: string, opts: ApiOptions = {}): Promise<T> {
   const method = opts.method ?? "GET";
-  const url = `/api${path}${path.includes("?") ? "&" : "?"}token=${TOKEN}`;
+  const url = appUrl(`/api${path}${path.includes("?") ? "&" : "?"}token=${TOKEN}`);
   const headers: Record<string, string> = { ...(opts.headers ?? {}) };
   headers["X-Siliconcode-Token"] = TOKEN;
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";

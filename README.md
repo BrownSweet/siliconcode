@@ -53,20 +53,28 @@ PRD/SDD 中的待澄清问题解决后，确认当前修订，再授权修改文
 不会自动提交、推送或部署。账户为个人管理员模式，命令以服务所在系统账户执行。
 使用说明、重启恢复、远程 HTTPS 部署和验证边界见 [浏览器工作台说明](docs/WORKBENCH.md)。
 
-## Docker 启动已有 Dashboard
+## Dockerfile 构建与启动
 
-在源码目录执行（需要 Docker Compose）：
+在源码目录执行（只需 Docker）：
 
 ```bash
-docker compose up -d --build
-docker compose logs --tail=30 siliconcode
+docker build --build-arg SILICONCODE_BASE_PATH=/siliconcode/ -t siliconcode:local .
+docker run -d --name siliconcode --init --restart unless-stopped \
+  -p 3100:3100 \
+  --mount "type=bind,source=$PWD,target=/workspace/project" \
+  -v siliconcode-state:/home/node/.siliconcode \
+  -v siliconcode-worktrees:/workspace/.siliconcode-worktrees \
+  -v siliconcode-node-modules:/workspace/project/node_modules \
+  siliconcode:local
+docker logs --tail=30 siliconcode
 ```
 
-在宿主机浏览器打开日志中的 `http://localhost:3100/?token=...` 完整地址。
-首次填写 DeepSeek API Key 后自动进入完整面板；配置和会话保存在 Docker 数据卷中。
-默认挂载当前项目，面板中的文件修改会同步到宿主机。默认端口只允许本机访问。
+打开日志中的 `http://localhost:3100/siliconcode/?token=...` 完整地址；远程访问将主机换成服务器 IP。
+通过外部 Nginx 访问时使用 `https://tec.zhiquant.com/siliconcode/?token=...`，上游为容器的 3100 端口，保留 `/siliconcode/` 前缀。
+首次填写 DeepSeek API Key 后进入面板；配置和会话保存在命名数据卷中。
+上述命令挂载当前项目，面板修改会同步到宿主机；3100 端口只应允许外部代理访问。
 
-更换项目、远程访问、自动交付与停止/升级操作见 [Docker 使用说明](docs/DOCKER.md)。
+项目目录、容器网络、Nginx 配置、持久化与升级步骤见 [Docker 使用说明](docs/DOCKER.md)。
 
 ## 常用命令
 

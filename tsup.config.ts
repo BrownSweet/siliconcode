@@ -1,7 +1,11 @@
 import { defineConfig } from "tsup";
+import { getBasePath } from "./src/server/base-path.js";
+
+const define = { __SILICONCODE_BASE_PATH__: JSON.stringify(getBasePath()) };
 
 export default defineConfig([
   {
+    define,
     entry: ["src/index.ts"],
     format: ["esm"],
     dts: true,
@@ -11,6 +15,7 @@ export default defineConfig([
     outDir: "dist",
   },
   {
+    define,
     entry: ["src/cli/index.ts"],
     format: ["esm"],
     dts: false,
@@ -28,6 +33,7 @@ export default defineConfig([
     },
   },
   {
+    define,
     entry: { app: "dashboard/app.js", workbench: "dashboard/src/workbench.ts" },
     format: ["esm"],
     dts: false,

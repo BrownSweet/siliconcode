@@ -1,3 +1,4 @@
+import { appUrl } from "./base-path.js";
 import { useEffect, useState } from "preact/hooks";
 import { TOKEN, api } from "./api.js";
 import { readDashboardStorage, writeDashboardStorage } from "./storage.js";
@@ -70,7 +71,7 @@ export function setLang(lang: DashboardLang): void {
   }
   for (const cb of listeners) cb();
   // keepalive ensures the request completes even during page unload (refresh).
-  fetch(`/api/settings?token=${TOKEN}`, {
+  fetch(appUrl(`/api/settings?token=${TOKEN}`), {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Siliconcode-Token": TOKEN },
     body: JSON.stringify({ lang: toBackendLang(lang) }),
